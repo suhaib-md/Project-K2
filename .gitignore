@@ -1,0 +1,19 @@
+# Terraform
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform/
+.terraform.lock.hcl
+
+# Sensitive files
+*.pem
+k8s-key*
+ssh_config
+inventory.ini
+admin.kubeconfig
+kubeconfigs/
+certs/
+encryption-config.yaml
+
+# Logs
+*.log
