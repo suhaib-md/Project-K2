@@ -3,9 +3,9 @@ output "vpc_id" {
   value       = module.networking.vpc_id
 }
 
-output "load_balancer_dns" {
-  description = "DNS name of the load balancer"
-  value       = module.load_balancer.lb_dns_name
+output "kubernetes_api_endpoint" {
+  description = "Kubernetes API server endpoint (first controller)"
+  value       = module.controllers.instances[0].public_ip
 }
 
 output "controller_instances" {
@@ -41,7 +41,7 @@ output "kubeconfig_setup" {
   description = "Commands to set up kubeconfig on your local machine"
   value = <<-EOT
     # After terraform apply completes, run:
-    export KUBERNETES_PUBLIC_ADDRESS=${module.load_balancer.lb_dns_name}
+    export KUBERNETES_PUBLIC_ADDRESS=${module.controllers.instances[0].public_ip}
     
     # The setup script will generate admin.kubeconfig
     # Copy it to your kubectl config:

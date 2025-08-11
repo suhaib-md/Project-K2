@@ -1,35 +1,3 @@
-# Load Balancer Security Group
-resource "aws_security_group" "lb_sg" {
-  name_prefix = "k8s-lb-"
-  vpc_id      = var.vpc_id
-
-  description = "Security group for Kubernetes API load balancer"
-
-  ingress {
-    description = "Kubernetes API HTTPS"
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "All outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = merge(var.tags, {
-    Name = "k8s-lb-sg"
-  })
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
 # Controller Security Group
 resource "aws_security_group" "controller_sg" {
   name_prefix = "k8s-controller-"
@@ -46,40 +14,13 @@ resource "aws_security_group" "controller_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Kubernetes API server
+  # Kubernetes API server (allows direct access since no load balancer)
   ingress {
     description = "Kubernetes API"
     from_port   = 6443
     to_port     = 6443
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # etcd server client API
-  ingress {
-    description     = "etcd client API"
-    from_port       = 2379
-    to_port         = 2380
-    protocol        = "tcp"
-    security_groups = [aws_security_group.controller_sg.id]
-  }
-
-  # Allow traffic from load balancer
-  ingress {
-    description     = "From load balancer"
-    from_port       = 6443
-    to_port         = 6443
-    protocol        = "tcp"
-    security_groups = [aws_security_group.lb_sg.id]
-  }
-
-  # Controller to controller communication
-  ingress {
-    description = "Controller internal"
-    from_port   = 0
-    to_port     = 65535
-    protocol    = "tcp"
-    self        = true
   }
 
   # ICMP
@@ -106,6 +47,28 @@ resource "aws_security_group" "controller_sg" {
   lifecycle {
     create_before_destroy = true
   }
+}
+
+# Separate rule for etcd communication between controllers
+resource "aws_security_group_rule" "controller_etcd_client" {
+  type                     = "ingress"
+  from_port                = 2379
+  to_port                  = 2380
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.controller_sg.id
+  security_group_id        = aws_security_group.controller_sg.id
+  description              = "etcd client API"
+}
+
+# Separate rule for controller to controller communication
+resource "aws_security_group_rule" "controller_internal" {
+  type                     = "ingress"
+  from_port                = 0
+  to_port                  = 65535
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.controller_sg.id
+  security_group_id        = aws_security_group.controller_sg.id
+  description              = "Controller internal communication"
 }
 
 # Worker Security Group
@@ -151,15 +114,6 @@ resource "aws_security_group" "worker_sg" {
     cidr_blocks = ["10.200.0.0/16"]
   }
 
-  # Worker to worker communication
-  ingress {
-    description = "Worker internal"
-    from_port   = 0
-    to_port     = 65535
-    protocol    = "tcp"
-    self        = true
-  }
-
   # ICMP
   ingress {
     description = "ICMP"
@@ -184,4 +138,15 @@ resource "aws_security_group" "worker_sg" {
   lifecycle {
     create_before_destroy = true
   }
+}
+
+# Separate rule for worker to worker communication
+resource "aws_security_group_rule" "worker_internal" {
+  type                     = "ingress"
+  from_port                = 0
+  to_port                  = 65535
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.worker_sg.id
+  security_group_id        = aws_security_group.worker_sg.id
+  description              = "Worker internal communication"
 }

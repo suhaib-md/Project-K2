@@ -53,9 +53,9 @@ resource "aws_instance" "instances" {
   }
 }
 
-# Attach instances to target group if provided
+# Attach instances to target group if provided (only for controllers)
 resource "aws_lb_target_group_attachment" "tg_attachment" {
-  count = var.target_group_arn != null ? var.instance_count : 0
+  count = var.attach_to_target_group ? var.instance_count : 0
 
   target_group_arn = var.target_group_arn
   target_id        = aws_instance.instances[count.index].id

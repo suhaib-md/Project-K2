@@ -54,22 +54,11 @@ module "security" {
   tags = var.common_tags
 }
 
-# Load balancer module
-module "load_balancer" {
-  source = "./modules/load_balancer"
-  
-  vpc_id              = module.networking.vpc_id
-  public_subnet_ids   = module.networking.public_subnet_ids
-  security_group_ids  = [module.security.lb_security_group_id]
-  
-  tags = var.common_tags
-}
-
-# Controller nodes module
+# Controller nodes module (reduced to 1 for vCPU limits)
 module "controllers" {
   source = "./modules/compute"
   
-  instance_count     = 3
+  instance_count     = 1  # Reduced from 3 to 1
   instance_type     = var.controller_instance_type
   key_name          = aws_key_pair.k8s_key_pair.key_name
   security_group_ids = [module.security.controller_security_group_id]
@@ -78,18 +67,18 @@ module "controllers" {
   name_prefix = "controller"
   user_data   = file("${path.module}/scripts/controller-userdata.sh")
   
-  target_group_arn = module.load_balancer.target_group_arn
+  attach_to_target_group = false
   
   tags = merge(var.common_tags, {
     Role = "controller"
   })
 }
 
-# Worker nodes module
+# Worker nodes module (reduced to 2 for vCPU limits)
 module "workers" {
   source = "./modules/compute"
   
-  instance_count     = 3
+  instance_count     = 2  # Reduced from 3 to 2
   instance_type     = var.worker_instance_type
   key_name          = aws_key_pair.k8s_key_pair.key_name
   security_group_ids = [module.security.worker_security_group_id]
@@ -97,6 +86,8 @@ module "workers" {
   
   name_prefix = "worker"
   user_data   = file("${path.module}/scripts/worker-userdata.sh")
+  
+  attach_to_target_group = false
   
   tags = merge(var.common_tags, {
     Role = "worker"
@@ -108,7 +99,7 @@ resource "local_file" "inventory" {
   content = templatefile("${path.module}/templates/inventory.tpl", {
     controllers = module.controllers.instances
     workers     = module.workers.instances
-    lb_dns      = module.load_balancer.lb_dns_name
+    lb_dns      = module.controllers.instances[0].public_ip
   })
   filename = "${path.module}/inventory.ini"
 }
@@ -134,7 +125,7 @@ resource "null_resource" "setup_kubernetes" {
   provisioner "local-exec" {
     command = "${path.module}/scripts/setup-k8s.sh"
     environment = {
-      LB_DNS = module.load_balancer.lb_dns_name
+      LB_DNS = module.controllers.instances[0].public_ip
     }
   }
 

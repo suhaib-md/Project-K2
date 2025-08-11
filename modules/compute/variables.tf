@@ -37,7 +37,13 @@ variable "user_data" {
 variable "target_group_arn" {
   description = "Target group ARN for load balancer"
   type        = string
-  default     = null
+  default     = ""
+}
+
+variable "attach_to_target_group" {
+  description = "Whether to attach instances to target group (only for controllers)"
+  type        = bool
+  default     = false
 }
 
 variable "root_volume_size" {
