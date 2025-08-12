@@ -696,7 +696,7 @@ EOF
             if sudo systemctl is-active --quiet etcd; then
                 echo 'etcd is running successfully'
                 # Test etcd connectivity
-                ETCDCTL_API=3 /usr/local/bin/etcdctl member list \
+                sudo ETCDCTL_API=3 /usr/local/bin/etcdctl member list \
                   --endpoints=https://127.0.0.1:2379 \
                   --cacert=/etc/etcd/ca.pem \
                   --cert=/etc/etcd/kubernetes.pem \
