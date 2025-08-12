@@ -66,38 +66,6 @@ run_on_workers() {
     done < inventory.ini
 }
 
-# Function to copy file to controllers
-copy_to_controllers() {
-    local file="$1"
-    local dest="$2"
-    while IFS= read -r line; do
-        if [[ $line =~ ^controller- ]]; then
-            host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
-            print_status "Copying $file to controller: $host"
-            scp -F ssh_config -o ConnectTimeout=30 -o StrictHostKeyChecking=no "$file" ubuntu@$host:"$dest" || {
-                print_error "Failed to copy $file to $host"
-                return 1
-            }
-        fi
-    done < inventory.ini
-}
-
-# Function to copy file to workers
-copy_to_workers() {
-    local file="$1"
-    local dest="$2"
-    while IFS= read -r line; do
-        if [[ $line =~ ^worker- ]]; then
-            host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
-            print_status "Copying $file to worker: $host"
-            scp -F ssh_config -o ConnectTimeout=30 -o StrictHostKeyChecking=no "$file" ubuntu@$host:"$dest" || {
-                print_error "Failed to copy $file to $host"
-                return 1
-            }
-        fi
-    done < inventory.ini
-}
-
 # Create certificates directory
 mkdir -p certs
 cd certs
@@ -505,47 +473,47 @@ EOF
 
 print_success "Encryption config generated successfully!"
 
-# FIXED: Step 4 - Distribute certificates properly
 print_status "Step 4: Distributing certificates and configs to nodes..."
 
 # First, create necessary directories on all nodes
 run_on_controllers "sudo mkdir -p /var/lib/kubernetes/ /etc/etcd/"
 run_on_workers "sudo mkdir -p /var/lib/kubelet/ /var/lib/kube-proxy/ /var/lib/kubernetes/"
 
-# Copy certificates to controllers with proper verification
+# **FIXED: Copy certificates to both locations on controllers**
 while IFS= read -r line; do
     if [[ $line =~ ^controller- ]]; then
         controller_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
         
-        print_status "Copying certs/ca.pem to controller: $controller_host"
+        print_status "Copying certificates to controller: $controller_host"
+        
+        # Copy to /tmp first
         scp -F ssh_config -o StrictHostKeyChecking=no certs/ca.pem ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying certs/ca-key.pem to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no certs/ca-key.pem ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying certs/kubernetes-key.pem to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no certs/kubernetes-key.pem ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying certs/kubernetes.pem to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no certs/kubernetes.pem ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying certs/service-account-key.pem to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no certs/service-account-key.pem ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying certs/service-account.pem to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no certs/service-account.pem ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying kubeconfigs/admin.kubeconfig to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no kubeconfigs/admin.kubeconfig ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying kubeconfigs/kube-controller-manager.kubeconfig to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no kubeconfigs/kube-controller-manager.kubeconfig ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying kubeconfigs/kube-scheduler.kubeconfig to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no kubeconfigs/kube-scheduler.kubeconfig ubuntu@$controller_host:/tmp/
-        
-        print_status "Copying encryption-config.yaml to controller: $controller_host"
         scp -F ssh_config -o StrictHostKeyChecking=no encryption-config.yaml ubuntu@$controller_host:/tmp/
+        
+        # **FIXED: Copy certificates to BOTH /etc/etcd/ and /var/lib/kubernetes/**
+        ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
+            # Copy for etcd (with etcd ownership)
+            sudo cp /tmp/ca.pem /tmp/kubernetes-key.pem /tmp/kubernetes.pem /etc/etcd/
+            sudo chown etcd:etcd /etc/etcd/*
+            
+            # Copy for kubernetes API server (all required certificates)
+            sudo cp /tmp/ca.pem /tmp/ca-key.pem /tmp/kubernetes.pem /tmp/kubernetes-key.pem /var/lib/kubernetes/
+            sudo cp /tmp/service-account.pem /tmp/service-account-key.pem /var/lib/kubernetes/
+            sudo cp /tmp/encryption-config.yaml /var/lib/kubernetes/
+            sudo cp /tmp/admin.kubeconfig /tmp/kube-controller-manager.kubeconfig /tmp/kube-scheduler.kubeconfig /var/lib/kubernetes/
+            
+            # Set proper permissions
+            sudo chown root:root /var/lib/kubernetes/*
+            sudo chmod 600 /var/lib/kubernetes/*-key.pem
+        "
     fi
 done < inventory.ini
 
@@ -577,9 +545,6 @@ run_on_controllers "
     sudo groupadd -f etcd
     sudo useradd -c \"etcd user\" -d /var/lib/etcd -s /bin/false -g etcd -r etcd 2>/dev/null || true
     sudo chown etcd:etcd /var/lib/etcd
-    # Move certificates to proper location
-    sudo mv /tmp/ca.pem /tmp/kubernetes-key.pem /tmp/kubernetes.pem /etc/etcd/
-    sudo chown etcd:etcd /etc/etcd/*
 "
 
 # Create etcd systemd service on each controller
@@ -660,19 +625,6 @@ run_on_controllers "
     
     chmod +x kube-apiserver kube-controller-manager kube-scheduler kubectl
     sudo mv kube-apiserver kube-controller-manager kube-scheduler kubectl /usr/local/bin/
-    
-    # FIXED: Properly move certificates that are still in /tmp
-    if [ -f /tmp/ca.pem ]; then sudo mv /tmp/ca.pem /var/lib/kubernetes/; fi
-    if [ -f /tmp/ca-key.pem ]; then sudo mv /tmp/ca-key.pem /var/lib/kubernetes/; fi
-    if [ -f /tmp/kubernetes-key.pem ]; then sudo mv /tmp/kubernetes-key.pem /var/lib/kubernetes/; fi
-    if [ -f /tmp/kubernetes.pem ]; then sudo mv /tmp/kubernetes.pem /var/lib/kubernetes/; fi
-    if [ -f /tmp/service-account-key.pem ]; then sudo mv /tmp/service-account-key.pem /var/lib/kubernetes/; fi
-    if [ -f /tmp/service-account.pem ]; then sudo mv /tmp/service-account.pem /var/lib/kubernetes/; fi
-    if [ -f /tmp/encryption-config.yaml ]; then sudo mv /tmp/encryption-config.yaml /var/lib/kubernetes/; fi
-    
-    sudo mv /tmp/kube-controller-manager.kubeconfig /var/lib/kubernetes/
-    sudo mv /tmp/kube-scheduler.kubeconfig /var/lib/kubernetes/
-    sudo mv /tmp/admin.kubeconfig /var/lib/kubernetes/
 "
 
 # Configure API server on each controller
@@ -695,6 +647,10 @@ while IFS= read -r line; do
         print_status "Configuring API server on $controller_name"
         
         ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
+            # **VERIFY CERTIFICATES EXIST**
+            echo 'Verifying certificates exist:'
+            ls -la /var/lib/kubernetes/
+            
             sudo tee /etc/systemd/system/kube-apiserver.service > /dev/null <<EOF
 [Unit]
 Description=Kubernetes API Server
@@ -798,7 +754,7 @@ EOF
             sudo systemctl enable kube-apiserver kube-controller-manager kube-scheduler
             sudo systemctl start kube-apiserver kube-controller-manager kube-scheduler
             
-            # FIXED: Wait for API server to be ready before proceeding
+            # Wait for API server to be ready before proceeding
             sleep 20
             
             # Verify API server is running
@@ -817,7 +773,7 @@ done < inventory.ini
 print_status "Waiting for API servers to be ready..."
 sleep 60
 
-# FIXED: Verify API server accessibility before RBAC setup
+# Verify API server accessibility before RBAC setup
 first_controller_host=$(grep "^controller-0" inventory.ini | cut -d' ' -f2 | cut -d'=' -f2)
 
 print_status "Verifying API server accessibility..."
@@ -841,7 +797,7 @@ print_success "Kubernetes control plane setup completed!"
 
 print_status "Step 7: Setting up RBAC for kubelet authorization..."
 
-# Configure RBAC on first controller - FIXED: Use proper kubeconfig path
+# Configure RBAC on first controller
 ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "
     kubectl apply --kubeconfig /var/lib/kubernetes/admin.kubeconfig -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
