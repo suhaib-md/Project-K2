@@ -475,11 +475,20 @@ print_success "Encryption config generated successfully!"
 
 print_status "Step 4: Distributing certificates and configs to nodes..."
 
-# First, create necessary directories on all nodes
-run_on_controllers "sudo mkdir -p /var/lib/kubernetes/ /etc/etcd/"
+# First, create necessary directories on all nodes and setup etcd user
+print_status "Setting up directories and users on controllers..."
+run_on_controllers "
+    sudo mkdir -p /var/lib/kubernetes/ /etc/etcd/ /var/lib/etcd/
+    sudo groupadd -f etcd || true
+    sudo useradd -c 'etcd user' -d /var/lib/etcd -s /bin/false -g etcd -r etcd 2>/dev/null || true
+    sudo chown etcd:etcd /var/lib/etcd
+    sudo chmod 755 /etc/etcd /var/lib/etcd
+"
+
+print_status "Setting up directories on workers..."
 run_on_workers "sudo mkdir -p /var/lib/kubelet/ /var/lib/kube-proxy/ /var/lib/kubernetes/"
 
-# **FIXED: Copy certificates to both locations on controllers**
+# Copy certificates to controllers
 while IFS= read -r line; do
     if [[ $line =~ ^controller- ]]; then
         controller_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
@@ -498,11 +507,18 @@ while IFS= read -r line; do
         scp -F ssh_config -o StrictHostKeyChecking=no kubeconfigs/kube-scheduler.kubeconfig ubuntu@$controller_host:/tmp/
         scp -F ssh_config -o StrictHostKeyChecking=no encryption-config.yaml ubuntu@$controller_host:/tmp/
         
-        # **FIXED: Copy certificates to BOTH /etc/etcd/ and /var/lib/kubernetes/**
+        # FIXED: Copy certificates to proper locations with correct ownership
         ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
-            # Copy for etcd (with etcd ownership)
-            sudo cp /tmp/ca.pem /tmp/kubernetes-key.pem /tmp/kubernetes.pem /etc/etcd/
-            sudo chown etcd:etcd /etc/etcd/*
+            # Copy for etcd (with etcd ownership) - ensure etcd user exists first
+            if id etcd >/dev/null 2>&1; then
+                sudo cp /tmp/ca.pem /tmp/kubernetes-key.pem /tmp/kubernetes.pem /etc/etcd/
+                sudo chown etcd:etcd /etc/etcd/*.pem
+                sudo chmod 600 /etc/etcd/*-key.pem
+                echo 'Certificates copied to /etc/etcd/ with etcd ownership'
+            else
+                echo 'ERROR: etcd user not found!'
+                exit 1
+            fi
             
             # Copy for kubernetes API server (all required certificates)
             sudo cp /tmp/ca.pem /tmp/ca-key.pem /tmp/kubernetes.pem /tmp/kubernetes-key.pem /var/lib/kubernetes/
@@ -513,6 +529,13 @@ while IFS= read -r line; do
             # Set proper permissions
             sudo chown root:root /var/lib/kubernetes/*
             sudo chmod 600 /var/lib/kubernetes/*-key.pem
+            sudo chmod 644 /var/lib/kubernetes/*.pem /var/lib/kubernetes/*.kubeconfig /var/lib/kubernetes/*.yaml
+            
+            echo 'Certificates copied to /var/lib/kubernetes/ with root ownership'
+            echo 'Listing /etc/etcd contents:'
+            ls -la /etc/etcd/
+            echo 'Listing /var/lib/kubernetes contents:'
+            ls -la /var/lib/kubernetes/
         "
     fi
 done < inventory.ini
@@ -529,6 +552,26 @@ while IFS= read -r line; do
         scp -F ssh_config -o StrictHostKeyChecking=no certs/${worker_name}.pem ubuntu@$worker_host:/tmp/
         scp -F ssh_config -o StrictHostKeyChecking=no kubeconfigs/${worker_name}.kubeconfig ubuntu@$worker_host:/tmp/
         scp -F ssh_config -o StrictHostKeyChecking=no kubeconfigs/kube-proxy.kubeconfig ubuntu@$worker_host:/tmp/
+        
+        # Move certificates to proper locations on workers and set permissions
+        ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$worker_host "
+            # Move files to their final destinations
+            sudo mv /tmp/ca.pem /var/lib/kubernetes/ca.pem
+            sudo mv /tmp/${worker_name}-key.pem /var/lib/kubelet/${worker_name}-key.pem
+            sudo mv /tmp/${worker_name}.pem /var/lib/kubelet/${worker_name}.pem
+            sudo mv /tmp/${worker_name}.kubeconfig /var/lib/kubelet/kubeconfig
+            sudo mv /tmp/kube-proxy.kubeconfig /var/lib/kube-proxy/kubeconfig
+            
+            # Set ownership for the directories
+            sudo chown -R root:root /var/lib/kubernetes/ /var/lib/kubelet/ /var/lib/kube-proxy/
+            
+            # Set specific file permissions
+            sudo chmod 600 /var/lib/kubelet/${worker_name}-key.pem
+            sudo chmod 644 /var/lib/kubelet/${worker_name}.pem
+            sudo chmod 644 /var/lib/kubernetes/ca.pem
+            sudo chmod 644 /var/lib/kubelet/kubeconfig
+            sudo chmod 644 /var/lib/kube-proxy/kubeconfig
+        "
     fi
 done < inventory.ini
 
@@ -541,10 +584,8 @@ run_on_controllers "
     wget -q --https-only --timestamping https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz
     tar -xvf etcd-${ETCD_VERSION}-linux-amd64.tar.gz
     sudo mv etcd-${ETCD_VERSION}-linux-amd64/etcd* /usr/local/bin/
-    sudo mkdir -p /etc/etcd /var/lib/etcd
-    sudo groupadd -f etcd
-    sudo useradd -c \"etcd user\" -d /var/lib/etcd -s /bin/false -g etcd -r etcd 2>/dev/null || true
-    sudo chown etcd:etcd /var/lib/etcd
+    sudo chmod +x /usr/local/bin/etcd*
+    echo 'etcd binaries installed successfully'
 "
 
 # Create etcd systemd service on each controller
@@ -568,14 +609,32 @@ while IFS= read -r line; do
         print_status "Setting up etcd on $controller_name"
         
         ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
+            # Verify etcd user and certificates exist before creating service
+            if ! id etcd >/dev/null 2>&1; then
+                echo 'ERROR: etcd user does not exist!'
+                exit 1
+            fi
+            
+            if [ ! -f /etc/etcd/kubernetes.pem ]; then
+                echo 'ERROR: etcd certificates not found in /etc/etcd/'
+                exit 1
+            fi
+            
+            # Create etcd service with proper ExecStartPre to ensure data directory
             sudo tee /etc/systemd/system/etcd.service > /dev/null <<EOF
 [Unit]
 Description=etcd
-Documentation=https://github.com/coreos
+Documentation=https://github.com/etcd-io/etcd
+Wants=network-online.target
+After=network-online.target
+Conflicts=etcd-member.service
 
 [Service]
 Type=notify
 User=etcd
+Group=etcd
+ExecStartPre=/bin/mkdir -p /var/lib/etcd
+ExecStartPre=/bin/chown etcd:etcd /var/lib/etcd
 ExecStart=/usr/local/bin/etcd \\\\
   --name ${controller_name} \\\\
   --cert-file=/etc/etcd/kubernetes.pem \\\\
@@ -593,22 +652,80 @@ ExecStart=/usr/local/bin/etcd \\\\
   --initial-cluster-token etcd-cluster-0 \\\\
   --initial-cluster ${ETCD_CLUSTER} \\\\
   --initial-cluster-state new \\\\
-  --data-dir=/var/lib/etcd
-Restart=on-failure
-RestartSec=5
+  --data-dir=/var/lib/etcd \\\\
+  --wal-dir=/var/lib/etcd/wal \\\\
+  --snapshot-count=10000 \\\\
+  --heartbeat-interval=100 \\\\
+  --election-timeout=1000 \\\\
+  --max-snapshots=5 \\\\
+  --max-wals=5 \\\\
+  --cors='*'
+Restart=always
+RestartSec=10s
+LimitNOFILE=40000
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
+            
+            # Ensure proper ownership of etcd data directory
+            sudo chown -R etcd:etcd /var/lib/etcd
+            sudo chmod 755 /var/lib/etcd
+            
+            # Reload systemd and enable etcd
             sudo systemctl daemon-reload
             sudo systemctl enable etcd
+            
+            echo 'Starting etcd service...'
             sudo systemctl start etcd
+            
+            # Wait and check status
+            sleep 10
+            sudo systemctl status etcd --no-pager -l || {
+                echo 'etcd failed to start, checking logs:'
+                sudo journalctl -u etcd --lines=20 --no-pager
+                exit 1
+            }
         "
+        
+        # Verify etcd is running before continuing
+        print_status "Verifying etcd is running on $controller_name..."
+        sleep 5
+        ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
+            if sudo systemctl is-active --quiet etcd; then
+                echo 'etcd is running successfully'
+                # Test etcd connectivity
+                ETCDCTL_API=3 /usr/local/bin/etcdctl member list \
+                  --endpoints=https://127.0.0.1:2379 \
+                  --cacert=/etc/etcd/ca.pem \
+                  --cert=/etc/etcd/kubernetes.pem \
+                  --key=/etc/etcd/kubernetes-key.pem || echo 'etcd member list failed'
+            else
+                echo 'ERROR: etcd is not running!'
+                sudo journalctl -u etcd --lines=30 --no-pager
+                exit 1
+            fi
+        " || {
+            print_error "etcd setup failed on $controller_name"
+            exit 1
+        }
     fi
 done < inventory.ini
 
-print_status "Waiting for etcd cluster to be ready..."
+print_status "Waiting for etcd cluster to stabilize..."
 sleep 30
+
+# Verify etcd cluster health
+first_controller_host=$(grep "^controller-0" inventory.ini | cut -d' ' -f2 | cut -d'=' -f2)
+ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "
+    echo 'Testing etcd cluster health:'
+    sudo ETCDCTL_API=3 /usr/local/bin/etcdctl endpoint health \
+      --endpoints=https://127.0.0.1:2379 \
+      --cacert=/etc/etcd/ca.pem \
+      --cert=/etc/etcd/kubernetes.pem \
+      --key=/etc/etcd/kubernetes-key.pem
+" || print_error "etcd cluster health check failed"
 
 print_success "etcd cluster setup completed!"
 
@@ -647,14 +764,26 @@ while IFS= read -r line; do
         print_status "Configuring API server on $controller_name"
         
         ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
-            # **VERIFY CERTIFICATES EXIST**
-            echo 'Verifying certificates exist:'
+            # Verify certificates exist before creating service
+            echo 'Verifying certificates exist in /var/lib/kubernetes/:'
             ls -la /var/lib/kubernetes/
+            
+            # Check that all required certificates are present
+            required_files=('ca.pem' 'ca-key.pem' 'kubernetes.pem' 'kubernetes-key.pem' 'service-account.pem' 'service-account-key.pem' 'encryption-config.yaml')
+            for file in \"\${required_files[@]}\"; do
+                if [ ! -f \"/var/lib/kubernetes/\$file\" ]; then
+                    echo \"ERROR: Required file \$file not found in /var/lib/kubernetes/\"
+                    exit 1
+                fi
+            done
+            echo 'All required certificates and configs are present'
             
             sudo tee /etc/systemd/system/kube-apiserver.service > /dev/null <<EOF
 [Unit]
 Description=Kubernetes API Server
 Documentation=https://github.com/kubernetes/kubernetes
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/kube-apiserver \\\\
@@ -689,6 +818,8 @@ ExecStart=/usr/local/bin/kube-apiserver \\\\
   --v=2
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=0
+LimitNOFILE=40000
 
 [Install]
 WantedBy=multi-user.target
@@ -699,6 +830,8 @@ EOF
 [Unit]
 Description=Kubernetes Controller Manager
 Documentation=https://github.com/kubernetes/kubernetes
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/kube-controller-manager \\\\
@@ -716,6 +849,7 @@ ExecStart=/usr/local/bin/kube-controller-manager \\\\
   --v=2
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -726,7 +860,7 @@ EOF
 apiVersion: kubescheduler.config.k8s.io/v1beta3
 kind: KubeSchedulerConfiguration
 clientConnection:
-  kubeconfig: "/var/lib/kubernetes/kube-scheduler.kubeconfig"
+  kubeconfig: \"/var/lib/kubernetes/kube-scheduler.kubeconfig\"
 leaderElection:
   leaderElect: true
 profiles:
@@ -737,6 +871,8 @@ EOF
 [Unit]
 Description=Kubernetes Scheduler
 Documentation=https://github.com/kubernetes/kubernetes
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/kube-scheduler \\\\
@@ -744,29 +880,59 @@ ExecStart=/usr/local/bin/kube-scheduler \\\\
   --v=2
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-            # Start services
+            # Start services one by one with proper error handling
             sudo systemctl daemon-reload
+            
+            # Enable services
             sudo systemctl enable kube-apiserver kube-controller-manager kube-scheduler
-            sudo systemctl start kube-apiserver kube-controller-manager kube-scheduler
             
-            # Wait for API server to be ready before proceeding
-            sleep 20
+            # Start API server first
+            echo 'Starting kube-apiserver...'
+            sudo systemctl start kube-apiserver
+            sleep 15
             
-            # Verify API server is running
-            for i in {1..30}; do
-                if sudo systemctl is-active --quiet kube-apiserver; then
-                    echo 'API server is running'
-                    break
-                fi
-                echo 'Waiting for API server to start...'
-                sleep 5
-            done
-        "
+            if ! sudo systemctl is-active --quiet kube-apiserver; then
+                echo 'ERROR: kube-apiserver failed to start'
+                sudo journalctl -u kube-apiserver --lines=20 --no-pager
+                exit 1
+            fi
+            echo 'kube-apiserver started successfully'
+            
+            # Start controller manager
+            echo 'Starting kube-controller-manager...'
+            sudo systemctl start kube-controller-manager
+            sleep 10
+            
+            if ! sudo systemctl is-active --quiet kube-controller-manager; then
+                echo 'ERROR: kube-controller-manager failed to start'
+                sudo journalctl -u kube-controller-manager --lines=20 --no-pager
+                exit 1
+            fi
+            echo 'kube-controller-manager started successfully'
+            
+            # Start scheduler
+            echo 'Starting kube-scheduler...'
+            sudo systemctl start kube-scheduler
+            sleep 5
+            
+            if ! sudo systemctl is-active --quiet kube-scheduler; then
+                echo 'ERROR: kube-scheduler failed to start'
+                sudo journalctl -u kube-scheduler --lines=20 --no-pager
+                exit 1
+            fi
+            echo 'kube-scheduler started successfully'
+            
+            echo 'All Kubernetes control plane components started successfully'
+        " || {
+            print_error "Kubernetes control plane setup failed on $controller_name"
+            exit 1
+        }
     fi
 done < inventory.ini
 
@@ -778,7 +944,7 @@ first_controller_host=$(grep "^controller-0" inventory.ini | cut -d' ' -f2 | cut
 
 print_status "Verifying API server accessibility..."
 for i in {1..30}; do
-    if ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "kubectl --kubeconfig /var/lib/kubernetes/admin.kubeconfig get nodes 2>/dev/null"; then
+    if ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "kubectl --kubeconfig /var/lib/kubernetes/admin.kubeconfig get componentstatuses 2>/dev/null"; then
         print_success "API server is accessible"
         break
     else
@@ -786,7 +952,14 @@ for i in {1..30}; do
         if [ $i -eq 30 ]; then
             print_error "API server failed to become accessible"
             # Show logs for debugging
-            ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "sudo journalctl -u kube-apiserver --lines=20 --no-pager"
+            ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "
+                echo '=== API Server Status ==='
+                sudo systemctl status kube-apiserver --no-pager -l
+                echo '=== API Server Logs ==='
+                sudo journalctl -u kube-apiserver --lines=30 --no-pager
+                echo '=== etcd Status ==='
+                sudo systemctl status etcd --no-pager -l
+            "
             exit 1
         fi
         sleep 10
@@ -836,7 +1009,10 @@ subjects:
     kind: User
     name: kubernetes
 EOF
-"
+" || {
+    print_error "RBAC configuration failed"
+    exit 1
+}
 
 print_success "RBAC configuration completed!"
 
@@ -906,6 +1082,7 @@ OOMScoreAdjust=-999
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
@@ -918,15 +1095,14 @@ while IFS= read -r line; do
         worker_name=$(echo $line | cut -d' ' -f1)
         worker_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
         worker_private_ip=$(echo $line | cut -d' ' -f3 | cut -d'=' -f2)
-        pod_cidr=$(echo $line | grep -oP 'pod_cidr=\K[^[:space:]]+')
+        pod_cidr="10.200.${worker_name: -1}.0/24"  # Generate pod CIDR based on worker index
         
         print_status "Configuring kubelet on $worker_name"
         
         ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$worker_host "
-            # Move certificates
-            sudo mv /tmp/${worker_name}-key.pem /tmp/${worker_name}.pem /var/lib/kubelet/
-            sudo mv /tmp/${worker_name}.kubeconfig /var/lib/kubelet/kubeconfig
-            sudo mv /tmp/ca.pem /var/lib/kubernetes/
+            # Verify certificates were copied correctly
+            echo 'Verifying certificates in /var/lib/kubelet/:'
+            ls -la /var/lib/kubelet/
             
             # Create kubelet config
             sudo tee /var/lib/kubelet/kubelet-config.yaml > /dev/null <<EOF
@@ -968,14 +1144,13 @@ ExecStart=/usr/local/bin/kubelet \\\\
   --v=2
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
             # Configure kube-proxy
-            sudo mv /tmp/kube-proxy.kubeconfig /var/lib/kube-proxy/kubeconfig
-            
             sudo tee /var/lib/kube-proxy/kube-proxy-config.yaml > /dev/null <<EOF
 kind: KubeProxyConfiguration
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
@@ -995,16 +1170,54 @@ ExecStart=/usr/local/bin/kube-proxy \\\\
   --config=/var/lib/kube-proxy/kube-proxy-config.yaml
 Restart=on-failure
 RestartSec=5
+TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-            # Start services
+            # Start services with error handling
             sudo systemctl daemon-reload
             sudo systemctl enable containerd kubelet kube-proxy
-            sudo systemctl start containerd kubelet kube-proxy
-        "
+            
+            echo 'Starting containerd...'
+            sudo systemctl start containerd
+            sleep 5
+            
+            if ! sudo systemctl is-active --quiet containerd; then
+                echo 'ERROR: containerd failed to start'
+                sudo journalctl -u containerd --lines=20 --no-pager
+                exit 1
+            fi
+            echo 'containerd started successfully'
+            
+            echo 'Starting kubelet...'
+            sudo systemctl start kubelet
+            sleep 10
+            
+            if ! sudo systemctl is-active --quiet kubelet; then
+                echo 'ERROR: kubelet failed to start'
+                sudo journalctl -u kubelet --lines=20 --no-pager
+                exit 1
+            fi
+            echo 'kubelet started successfully'
+            
+            echo 'Starting kube-proxy...'
+            sudo systemctl start kube-proxy
+            sleep 5
+            
+            if ! sudo systemctl is-active --quiet kube-proxy; then
+                echo 'ERROR: kube-proxy failed to start'
+                sudo journalctl -u kube-proxy --lines=20 --no-pager
+                exit 1
+            fi
+            echo 'kube-proxy started successfully'
+            
+            echo 'All worker components started successfully'
+        " || {
+            print_error "Worker setup failed on $worker_name"
+            exit 1
+        }
     fi
 done < inventory.ini
 
@@ -1039,17 +1252,41 @@ print_success "Admin kubeconfig created: admin.kubeconfig"
 
 print_status "Step 10: Installing Pod network (Weave Net)..."
 
-# Install pod network
-kubectl --kubeconfig=admin.kubeconfig apply -f "https://cloud.weave.works/k8s/net?k8s-version=\$(kubectl --kubeconfig=admin.kubeconfig version | base64 | tr -d '\n')&env.IPALLOC_RANGE=10.200.0.0/16"
+# Wait for nodes to be ready before installing network
+print_status "Waiting for nodes to be ready..."
+for i in {1..20}; do
+    if kubectl --kubeconfig=admin.kubeconfig get nodes 2>/dev/null | grep -q "Ready\|NotReady"; then
+        print_status "Nodes are registering, proceeding with network installation..."
+        break
+    fi
+    print_status "Waiting for nodes to register... (attempt $i/20)"
+    sleep 15
+done
+
+# Install pod network with correct CIDR range
+kubectl --kubeconfig=admin.kubeconfig apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl --kubeconfig=admin.kubeconfig version | base64 | tr -d '\n')&env.IPALLOC_RANGE=10.200.0.0/16" || {
+    print_error "Failed to install Weave network"
+    # Try alternative method
+    print_status "Trying alternative Weave installation..."
+    kubectl --kubeconfig=admin.kubeconfig apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml || {
+        print_error "Alternative Weave installation also failed"
+    }
+}
 
 print_status "Waiting for pod network to be ready..."
-sleep 30
+sleep 60
 
 print_status "Final verification..."
 
 # Test the cluster
-kubectl --kubeconfig=admin.kubeconfig get nodes
-kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces
+print_status "Getting cluster nodes..."
+kubectl --kubeconfig=admin.kubeconfig get nodes -o wide || print_error "Failed to get nodes"
+
+print_status "Getting cluster pods..."
+kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces || print_error "Failed to get pods"
+
+print_status "Getting cluster component status..."
+kubectl --kubeconfig=admin.kubeconfig get componentstatuses || print_error "Failed to get component status"
 
 print_success "Kubernetes The Hard Way setup completed successfully!"
 print_success "Use 'kubectl --kubeconfig=admin.kubeconfig' to interact with your cluster"
@@ -1063,5 +1300,15 @@ echo "Cluster endpoint: https://${KUBERNETES_PUBLIC_ADDRESS}:6443"
 echo "Admin kubeconfig: admin.kubeconfig"
 echo "SSH config: ssh_config"
 echo "Private key: k8s-key.pem"
+echo ""
+echo "Quick test commands:"
+echo "  kubectl --kubeconfig=admin.kubeconfig get nodes"
+echo "  kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces"
+echo "  kubectl --kubeconfig=admin.kubeconfig cluster-info"
+echo ""
+echo "To use kubectl without --kubeconfig flag:"
+echo "  export KUBECONFIG=\$PWD/admin.kubeconfig"
+echo "  # OR"
+echo "  cp admin.kubeconfig ~/.kube/config"
 echo "=============================================="
 echo -e "${NC}"
