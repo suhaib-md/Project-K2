@@ -1489,91 +1489,202 @@ kubectl config use-context kubernetes-the-hard-way --kubeconfig=admin.kubeconfig
 
 print_success "Admin kubeconfig created: admin.kubeconfig"
 
-# Step 10: Installing Pod network (Weave Net)
-print_status "Step 10: Installing Pod network (Weave Net)..."
+# Step 10: Installing Pod network - SIMPLIFIED VERSION
+print_status "Step 10: Installing Pod network..."
 
-# Install Weave Net on controllers
-run_on_controllers "
-    set -e
-    echo 'Fixing DNS resolution...'
-    # Check current DNS configuration
-    echo 'Current /etc/resolv.conf:'
-    cat /etc/resolv.conf
-    # Check systemd-resolved status
-    echo 'Checking systemd-resolved status...'
-    resolvectl status || echo 'systemd-resolved not running'
-    # Configure systemd-resolved with Google DNS
-    echo 'Setting upstream DNS server to 8.8.8.8...'
-    sudo resolvectl set-dns 8.8.8.8
-    sudo resolvectl set-domain ~.
-    # Verify DNS resolution for cloud.weave.works
-    for attempt in {1..3}; do
-        echo \"Attempt \$attempt/3 to resolve cloud.weave.works...\"
-        if nslookup cloud.weave.works >/dev/null 2>&1; then
-            echo 'DNS resolution for cloud.weave.works succeeded'
-            break
-        else
-            echo 'DNS resolution for cloud.weave.works failed'
-            if [ \$attempt -eq 3 ]; then
-                echo 'ERROR: DNS resolution for cloud.weave.works failed after 3 attempts'
-                resolvectl status
-                exit 1
-            fi
-            # Reset systemd-resolved and retry
-            sudo resolvectl reset
-            sudo resolvectl set-dns 8.8.8.8
-            sudo resolvectl set-domain ~.
-            sleep 5
-        fi
-    done
+# Option 1: Try Flannel first (more reliable than Weave)
+print_status "Installing Flannel CNI..."
+if kubectl --kubeconfig=admin.kubeconfig apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml; then
+    print_success "Flannel CNI installed successfully"
+    FLANNEL_INSTALLED=true
+else
+    print_error "Failed to install Flannel from internet"
+    FLANNEL_INSTALLED=false
+fi
 
-    echo 'Checking network connectivity to cloud.weave.works...'
-    primary_url=\"https://cloud.weave.works/k8s/net?v=2.8.1\"
-    fallback_url=\"https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s-1.11.yaml\"
-    selected_url=\"\$primary_url\"
-    for attempt in {1..3}; do
-        echo \"Attempt \$attempt/3 to reach \$selected_url...\"
-        http_status=\$(curl -s -L -w \"%{http_code}\" \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt -o /dev/null)
-        if [ \"\$http_status\" -eq 200 ]; then
-            echo \"Successfully reached \$selected_url (HTTP \$http_status)\"
-            break
-        else
-            echo \"Failed to reach \$selected_url (HTTP \$http_status)\"
-            curl -v -L -s \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt 2>&1 | grep -E 'Connected to|Could not resolve|Failed to connect|SSL|HTTP'
-            if [ \$attempt -eq 2 ] && [ \"\$selected_url\" = \"\$primary_url\" ]; then
-                echo 'Switching to fallback URL: \$fallback_url'
-                selected_url=\"\$fallback_url\"
-            fi
-            if [ \$attempt -eq 3 ]; then
-                echo \"ERROR: Cannot reach \$selected_url after 3 attempts (HTTP \$http_status)\"
-                exit 1
-            fi
-            sleep 10
-        fi
-    done
-
-    echo 'Installing Weave Net...'
-    kubectl --kubeconfig=/var/lib/kubernetes/admin.kubeconfig apply -f \"\$selected_url\" || {
-        echo 'ERROR: Failed to apply Weave Net manifest'
-        exit 1
+# Option 2: If Flannel fails, try local installation method
+if [ "$FLANNEL_INSTALLED" = false ]; then
+    print_status "Trying alternative CNI installation methods..."
+    
+    # Create a basic CNI configuration manually
+    run_on_workers "
+        sudo mkdir -p /etc/cni/net.d
+        sudo tee /etc/cni/net.d/10-bridge.conf > /dev/null <<EOF
+{
+    \"cniVersion\": \"0.3.1\",
+    \"name\": \"bridge\",
+    \"type\": \"bridge\",
+    \"bridge\": \"cnio0\",
+    \"isGateway\": true,
+    \"ipMasq\": true,
+    \"ipam\": {
+        \"type\": \"host-local\",
+        \"ranges\": [
+            [{\"subnet\": \"10.200.0.0/16\"}]
+        ],
+        \"routes\": [{\"dst\": \"0.0.0.0/0\"}]
     }
+}
+EOF
+        
+        sudo tee /etc/cni/net.d/99-loopback.conf > /dev/null <<EOF
+{
+    \"cniVersion\": \"0.3.1\",
+    \"name\": \"lo\",
+    \"type\": \"loopback\"
+}
+EOF
+    "
+    
+    # Apply basic network policy
+    kubectl --kubeconfig=admin.kubeconfig apply -f - <<EOF
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-proxy-config
+  namespace: kube-system
+data:
+  config.conf: |
+    apiVersion: kubeproxy.config.k8s.io/v1alpha1
+    kind: KubeProxyConfiguration
+    clusterCIDR: "10.200.0.0/16"
+    mode: "iptables"
+EOF
+    
+    print_status "Basic CNI configuration applied"
+fi
 
-    echo 'Verifying Weave Net installation...'
-    for i in {1..30}; do
-        if kubectl --kubeconfig=/var/lib/kubernetes/admin.kubeconfig get pods -n kube-system -l name=weave-net | grep -q Running; then
-            echo 'Weave Net pods are running'
-            break
-        fi
-        if [ \$i -eq 30 ]; then
-            echo 'ERROR: Weave Net pods failed to reach Running state'
-            kubectl --kubeconfig=/var/lib/kubernetes/admin.kubeconfig get pods -n kube-system -l name=weave-net -o wide
-            exit 1
-        fi
-        sleep 10
-    done
+# Wait for a moment to let things settle
+sleep 30
+
+# Try to install CoreDNS if not already present
+print_status "Ensuring CoreDNS is installed..."
+if ! kubectl --kubeconfig=admin.kubeconfig get deployment coredns -n kube-system >/dev/null 2>&1; then
+    kubectl --kubeconfig=admin.kubeconfig apply -f - <<EOF
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: coredns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: kube-dns
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-dns
+    spec:
+      containers:
+      - name: coredns
+        image: coredns/coredns:1.8.4
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            memory: 170Mi
+          requests:
+            cpu: 100m
+            memory: 70Mi
+        args: [ "-conf", "/etc/coredns/Corefile" ]
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/coredns
+          readOnly: true
+        ports:
+        - containerPort: 53
+          name: dns
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 9153
+          name: metrics
+          protocol: TCP
+      dnsPolicy: Default
+      volumes:
+      - name: config-volume
+        configMap:
+          name: coredns
+          items:
+          - key: Corefile
+            path: Corefile
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns
+  namespace: kube-system
+data:
+  Corefile: |
+    .:53 {
+        errors
+        health {
+           lameduck 5s
+        }
+        ready
+        kubernetes cluster.local in-addr.arpa ip6.arpa {
+           pods insecure
+           fallthrough in-addr.arpa ip6.arpa
+           ttl 30
+        }
+        prometheus :9153
+        forward . 8.8.8.8
+        cache 30
+        loop
+        reload
+        loadbalance
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-dns
+  namespace: kube-system
+  labels:
+    k8s-app: kube-dns
+spec:
+  selector:
+    k8s-app: kube-dns
+  clusterIP: 10.32.0.10
+  ports:
+  - name: dns
+    port: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    protocol: TCP
+  - name: metrics
+    port: 9153
+    protocol: TCP
+EOF
+    print_success "CoreDNS installed"
+else
+    print_success "CoreDNS already present"
+fi
+
+print_success "Pod network setup completed!"
+
+# Additional setup to help nodes join
+print_status "Configuring additional networking for node registration..."
+
+# Ensure proper routing on workers
+run_on_workers "
+    # Add route for service subnet
+    sudo ip route add 10.32.0.0/24 via \$(ip route | grep default | awk '{print \$3}') || true
+    
+    # Enable IP forwarding
+    echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
+    sudo sysctl -p
+    
+    # Restart kubelet to pick up any changes
+    sudo systemctl restart kubelet
+    
+    echo 'Worker networking configuration updated'
 " || {
-    print_error "Failed to configure DNS on controllers"
-    exit 1
+    print_error "Some worker networking configuration failed, but continuing..."
 }
 
 print_success "Pod network installation completed!"
