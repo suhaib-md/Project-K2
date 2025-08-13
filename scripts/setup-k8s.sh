@@ -1492,72 +1492,91 @@ print_success "Admin kubeconfig created: admin.kubeconfig"
 # Step 10: Installing Pod network (Weave Net)
 print_status "Step 10: Installing Pod network (Weave Net)..."
 
-# Ensure DNS resolution
+# Install Weave Net on controllers
 run_on_controllers "
     set -e
     echo 'Fixing DNS resolution...'
-    sudo bash -c 'echo \"nameserver 8.8.8.8\" > /etc/resolv.conf'
-    if ! nslookup cloud.weave.works >/dev/null; then
-        echo 'ERROR: DNS resolution for cloud.weave.works failed'
+    # Check current DNS configuration
+    echo 'Current /etc/resolv.conf:'
+    cat /etc/resolv.conf
+    # Check systemd-resolved status
+    echo 'Checking systemd-resolved status...'
+    resolvectl status || echo 'systemd-resolved not running'
+    # Configure systemd-resolved with Google DNS
+    echo 'Setting upstream DNS server to 8.8.8.8...'
+    sudo resolvectl set-dns 8.8.8.8
+    sudo resolvectl set-domain ~.
+    # Verify DNS resolution for cloud.weave.works
+    for attempt in {1..3}; do
+        echo \"Attempt \$attempt/3 to resolve cloud.weave.works...\"
+        if nslookup cloud.weave.works >/dev/null 2>&1; then
+            echo 'DNS resolution for cloud.weave.works succeeded'
+            break
+        else
+            echo 'DNS resolution for cloud.weave.works failed'
+            if [ \$attempt -eq 3 ]; then
+                echo 'ERROR: DNS resolution for cloud.weave.works failed after 3 attempts'
+                resolvectl status
+                exit 1
+            fi
+            # Reset systemd-resolved and retry
+            sudo resolvectl reset
+            sudo resolvectl set-dns 8.8.8.8
+            sudo resolvectl set-domain ~.
+            sleep 5
+        fi
+    done
+
+    echo 'Checking network connectivity to cloud.weave.works...'
+    primary_url=\"https://cloud.weave.works/k8s/net?v=2.8.1\"
+    fallback_url=\"https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s-1.11.yaml\"
+    selected_url=\"\$primary_url\"
+    for attempt in {1..3}; do
+        echo \"Attempt \$attempt/3 to reach \$selected_url...\"
+        http_status=\$(curl -s -L -w \"%{http_code}\" \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt -o /dev/null)
+        if [ \"\$http_status\" -eq 200 ]; then
+            echo \"Successfully reached \$selected_url (HTTP \$http_status)\"
+            break
+        else
+            echo \"Failed to reach \$selected_url (HTTP \$http_status)\"
+            curl -v -L -s \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt 2>&1 | grep -E 'Connected to|Could not resolve|Failed to connect|SSL|HTTP'
+            if [ \$attempt -eq 2 ] && [ \"\$selected_url\" = \"\$primary_url\" ]; then
+                echo 'Switching to fallback URL: \$fallback_url'
+                selected_url=\"\$fallback_url\"
+            fi
+            if [ \$attempt -eq 3 ]; then
+                echo \"ERROR: Cannot reach \$selected_url after 3 attempts (HTTP \$http_status)\"
+                exit 1
+            fi
+            sleep 10
+        fi
+    done
+
+    echo 'Installing Weave Net...'
+    kubectl --kubeconfig=/var/lib/kubernetes/admin.kubeconfig apply -f \"\$selected_url\" || {
+        echo 'ERROR: Failed to apply Weave Net manifest'
         exit 1
-    fi
+    }
+
+    echo 'Verifying Weave Net installation...'
+    for i in {1..30}; do
+        if kubectl --kubeconfig=/var/lib/kubernetes/admin.kubeconfig get pods -n kube-system -l name=weave-net | grep -q Running; then
+            echo 'Weave Net pods are running'
+            break
+        fi
+        if [ \$i -eq 30 ]; then
+            echo 'ERROR: Weave Net pods failed to reach Running state'
+            kubectl --kubeconfig=/var/lib/kubernetes/admin.kubeconfig get pods -n kube-system -l name=weave-net -o wide
+            exit 1
+        fi
+        sleep 10
+    done
 " || {
     print_error "Failed to configure DNS on controllers"
     exit 1
 }
 
-# Wait for nodes to be ready
-print_status "Waiting for nodes to be ready..."
-for attempt in {1..30}; do
-    print_status "Waiting for nodes to register... (attempt $attempt/30)"
-    nodes_ready=$(kubectl --kubeconfig=admin.kubeconfig get nodes -o jsonpath='{.items[?(@.status.conditions[-1].type=="Ready")].status.conditions[-1].status}' | grep -c True || true)
-    if [ "$nodes_ready" -ge 2 ]; then
-        print_status "All worker nodes are ready!"
-        break
-    fi
-    if [ $attempt -eq 30 ]; then
-        print_error "Worker nodes failed to register after 15 minutes"
-        kubectl --kubeconfig=admin.kubeconfig get nodes -o wide
-        for node in worker-0 worker-1; do
-            ssh -F ssh_config -o ConnectTimeout=10 -o StrictHostKeyChecking=no $node "
-                echo 'Checking kubelet status on $node...'
-                sudo systemctl status kubelet --no-pager
-                sudo journalctl -u kubelet --no-pager -n 50
-                echo 'Checking API server connectivity...'
-                curl -k https://${KUBERNETES_PUBLIC_ADDRESS}:6443 || echo 'Failed to connect to API server'
-            "
-        done
-        exit 1
-    fi
-    sleep 30
-done
-
-# Install Weave Net
-print_status "Installing Weave Net..."
-kubectl --kubeconfig=admin.kubeconfig apply -f https://cloud.weave.works/k8s/net?k8s-version=v1.28.3 || {
-    print_status "Trying alternative Weave installation..."
-    kubectl --kubeconfig=admin.kubeconfig apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml || {
-        print_error "Failed to install Weave network"
-        exit 1
-    }
-}
-
-# Wait for Weave Net pods to be ready
-print_status "Waiting for pod network to be ready..."
-for attempt in {1..10}; do
-    pods_ready=$(kubectl --kubeconfig=admin.kubeconfig get pods -n kube-system -l name=weave-net -o jsonpath='{.items[?(@.status.phase=="Running")].status.phase}' | grep -c Running || true)
-    if [ "$pods_ready" -ge 2 ]; then
-        print_status "Weave Net pods are ready!"
-        break
-    fi
-    if [ $attempt -eq 10 ]; then
-        print_error "Weave Net pods failed to start after 5 minutes"
-        kubectl --kubeconfig=admin.kubeconfig get pods -n kube-system -o wide
-        kubectl --kubeconfig=admin.kubeconfig get events -n kube-system
-        exit 1
-    fi
-    sleep 30
-done
+print_success "Pod network installation completed!"
 
 # Final verification
 print_status "Final verification..."
