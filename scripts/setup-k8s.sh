@@ -13,9 +13,10 @@ echo -e "${GREEN}Starting Kubernetes The Hard Way Setup...${NC}"
 # Set variables
 KUBERNETES_VERSION="v1.28.3"
 ETCD_VERSION="v3.5.10"
-CNI_VERSION="v1.3.0"
-CONTAINERD_VERSION="1.7.8"
-RUNC_VERSION="v1.1.9"
+CNI_VERSION=v1.1.0
+CONTAINERD_VERSION=1.7.3
+CRICTL_VERSION=v1.28.0
+KUBELET_VERSION=v1.28.3
 
 KUBERNETES_PUBLIC_ADDRESS="${LB_DNS}"
 
@@ -41,9 +42,9 @@ run_on_controllers() {
     local cmd="$1"
     while IFS= read -r line; do
         if [[ $line =~ ^controller- ]]; then
-            host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
+            host=$(echo $line | cut -d' ' -f1)  # Changed to extract name (e.g., controller-0)
             print_status "Running on controller: $host"
-            ssh -F ssh_config -o ConnectTimeout=30 -o StrictHostKeyChecking=no ubuntu@$host "$cmd" || {
+            ssh -F ssh_config -o ConnectTimeout=30 -o StrictHostKeyChecking=no $host "$cmd" || {
                 print_error "Failed to execute on $host"
                 return 1
             }
@@ -56,9 +57,9 @@ run_on_workers() {
     local cmd="$1"
     while IFS= read -r line; do
         if [[ $line =~ ^worker- ]]; then
-            host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
+            host=$(echo $line | cut -d' ' -f1)  # Changed to extract name (e.g., worker-0)
             print_status "Running on worker: $host"
-            ssh -F ssh_config -o ConnectTimeout=30 -o StrictHostKeyChecking=no ubuntu@$host "$cmd" || {
+            ssh -F ssh_config -o ConnectTimeout=30 -o StrictHostKeyChecking=no $host "$cmd" || {
                 print_error "Failed to execute on $host"
                 return 1
             }
@@ -577,155 +578,143 @@ done < inventory.ini
 
 print_success "Certificates and configs distributed successfully!"
 
+# Step 5: Setting up etcd cluster on controllers
 print_status "Step 5: Setting up etcd cluster on controllers..."
 
-# Download and install etcd on controllers
-run_on_controllers "
-    wget -q --https-only --timestamping https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz
-    tar -xvf etcd-${ETCD_VERSION}-linux-amd64.tar.gz
-    sudo mv etcd-${ETCD_VERSION}-linux-amd64/etcd* /usr/local/bin/
-    sudo chmod +x /usr/local/bin/etcd*
-    echo 'etcd binaries installed successfully'
-"
+# Wait longer after certificate copying to ensure instance stability
+print_status "Waiting for controller instance to stabilize after certificate copying..."
+sleep 60
 
-# Create etcd systemd service on each controller
-while IFS= read -r line; do
-    if [[ $line =~ ^controller- ]]; then
-        controller_name=$(echo $line | cut -d' ' -f1)
-        controller_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
-        controller_private_ip=$(echo $line | cut -d' ' -f3 | cut -d'=' -f2)
-        
-        # Get all controller IPs for cluster formation
-        ETCD_CLUSTER=""
-        while IFS= read -r inner_line; do
-            if [[ $inner_line =~ ^controller- ]]; then
-                inner_name=$(echo $inner_line | cut -d' ' -f1)
-                inner_private_ip=$(echo $inner_line | cut -d' ' -f3 | cut -d'=' -f2)
-                ETCD_CLUSTER="${ETCD_CLUSTER}${inner_name}=https://${inner_private_ip}:2380,"
-            fi
-        done < inventory.ini
-        ETCD_CLUSTER=${ETCD_CLUSTER%,}
-        
-        print_status "Setting up etcd on $controller_name"
-        
-        ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
-            # Verify etcd user and certificates exist before creating service
-            if ! id etcd >/dev/null 2>&1; then
-                echo 'ERROR: etcd user does not exist!'
-                exit 1
-            fi
-            
-            if [ ! -f /etc/etcd/kubernetes.pem ]; then
-                echo 'ERROR: etcd certificates not found in /etc/etcd/'
-                exit 1
-            fi
-            
-            # Create etcd service with proper ExecStartPre to ensure data directory
-            sudo tee /etc/systemd/system/etcd.service > /dev/null <<EOF
+# Pre-check SSH connectivity
+run_on_controllers "
+    echo 'Checking SSH responsiveness and system status...'
+    uptime
+    sudo systemctl status ssh --no-pager
+    if ! sudo systemctl is-active --quiet ssh; then
+        echo 'ERROR: SSH daemon is not active'
+        exit 1
+    fi
+    echo 'SSH daemon is active'
+" || {
+    print_error "SSH pre-check failed on controller-0"
+    exit 1
+}
+
+# Wait for Cloud-Init to complete on controllers
+run_on_controllers "
+    echo 'Waiting for Cloud-Init to complete...'
+    for i in {1..30}; do
+        if [ -f /tmp/cloud-init-complete ]; then
+            echo 'Cloud-Init completed'
+            break
+        fi
+        echo 'Waiting for Cloud-Init... (attempt $i/30)'
+        sleep 10
+    done
+    if [ ! -f /tmp/cloud-init-complete ]; then
+        echo 'ERROR: Cloud-Init did not complete in time'
+        exit 1
+    fi
+    echo 'Checking system load...'
+    uptime
+    free -m
+" || {
+    print_error "Cloud-Init check failed on controller-0"
+    exit 1
+}
+
+# Install and configure etcd with retries
+run_on_controllers "
+    set -e
+    echo 'Installing etcd...'
+    wget -q --show-progress --https-only --timestamping \
+        \"https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz\"
+    tar -xzf etcd-${ETCD_VERSION}-linux-amd64.tar.gz
+    sudo mv etcd-${ETCD_VERSION}-linux-amd64/etcd* /usr/local/bin/
+    rm -rf etcd-${ETCD_VERSION}-linux-amd64*
+    
+    echo 'Creating etcd systemd unit...'
+    sudo mkdir -p /var/lib/etcd /etc/etcd
+    sudo chown etcd:etcd /var/lib/etcd
+    
+    # Get private IP for etcd configuration
+    TOKEN=\$(curl -X PUT \"http://169.254.169.254/latest/api/token\" -H \"X-aws-ec2-metadata-token-ttl-seconds: 21600\")
+    PRIVATE_IP=\$(curl -H \"X-aws-ec2-metadata-token: \$TOKEN\" -s http://169.254.169.254/latest/meta-data/local-ipv4)
+    
+    sudo tee /etc/systemd/system/etcd.service > /dev/null <<EOF
 [Unit]
 Description=etcd
 Documentation=https://github.com/etcd-io/etcd
-Wants=network-online.target
-After=network-online.target
-Conflicts=etcd-member.service
+After=network.target
 
 [Service]
-Type=notify
 User=etcd
-Group=etcd
-ExecStartPre=/bin/mkdir -p /var/lib/etcd
-ExecStartPre=/bin/chown etcd:etcd /var/lib/etcd
-ExecStart=/usr/local/bin/etcd \\\\
-  --name ${controller_name} \\\\
-  --cert-file=/etc/etcd/kubernetes.pem \\\\
-  --key-file=/etc/etcd/kubernetes-key.pem \\\\
-  --peer-cert-file=/etc/etcd/kubernetes.pem \\\\
-  --peer-key-file=/etc/etcd/kubernetes-key.pem \\\\
-  --trusted-ca-file=/etc/etcd/ca.pem \\\\
-  --peer-trusted-ca-file=/etc/etcd/ca.pem \\\\
-  --peer-client-cert-auth \\\\
-  --client-cert-auth \\\\
-  --initial-advertise-peer-urls https://${controller_private_ip}:2380 \\\\
-  --listen-peer-urls https://${controller_private_ip}:2380 \\\\
-  --listen-client-urls https://${controller_private_ip}:2379,https://127.0.0.1:2379 \\\\
-  --advertise-client-urls https://${controller_private_ip}:2379 \\\\
-  --initial-cluster-token etcd-cluster-0 \\\\
-  --initial-cluster ${ETCD_CLUSTER} \\\\
-  --initial-cluster-state new \\\\
-  --data-dir=/var/lib/etcd \\\\
-  --wal-dir=/var/lib/etcd/wal \\\\
-  --snapshot-count=10000 \\\\
-  --heartbeat-interval=100 \\\\
-  --election-timeout=1000 \\\\
-  --max-snapshots=5 \\\\
-  --max-wals=5 \\\\
-  --cors='*'
-Restart=always
-RestartSec=10s
-LimitNOFILE=40000
-TimeoutStartSec=0
+Type=notify
+ExecStart=/usr/local/bin/etcd \\
+  --name \${HOSTNAME} \\
+  --cert-file=/etc/etcd/kubernetes.pem \\
+  --key-file=/etc/etcd/kubernetes-key.pem \\
+  --peer-cert-file=/etc/etcd/kubernetes.pem \\
+  --peer-key-file=/etc/etcd/kubernetes-key.pem \\
+  --trusted-ca-file=/etc/etcd/ca.pem \\
+  --peer-trusted-ca-file=/etc/etcd/ca.pem \\
+  --peer-client-cert-auth \\
+  --client-cert-auth \\
+  --initial-advertise-peer-urls https://\${PRIVATE_IP}:2380 \\
+  --listen-peer-urls https://\${PRIVATE_IP}:2380 \\
+  --listen-client-urls https://\${PRIVATE_IP}:2379,https://127.0.0.1:2379 \\
+  --advertise-client-urls https://\${PRIVATE_IP}:2379 \\
+  --initial-cluster-token etcd-cluster-0 \\
+  --initial-cluster \${HOSTNAME}=https://\${PRIVATE_IP}:2380 \\
+  --initial-cluster-state new \\
+  --data-dir=/var/lib/etcd \\
+  --wal-dir=/var/lib/etcd/wal \\
+  --snapshot-count=10000 \\
+  --heartbeat-interval=100 \\
+  --election-timeout=1000 \\
+  --max-snapshots=5 \\
+  --max-wals=5 \\
+  --cors=*
+Restart=on-failure
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 EOF
-            
-            # Ensure proper ownership of etcd data directory
-            sudo chown -R etcd:etcd /var/lib/etcd
-            sudo chmod 755 /var/lib/etcd
-            
-            # Reload systemd and enable etcd
-            sudo systemctl daemon-reload
-            sudo systemctl enable etcd
-            
-            echo 'Starting etcd service...'
-            sudo systemctl start etcd
-            
-            # Wait and check status
-            sleep 10
-            sudo systemctl status etcd --no-pager -l || {
-                echo 'etcd failed to start, checking logs:'
-                sudo journalctl -u etcd --lines=20 --no-pager
-                exit 1
-            }
-        "
-        
-        # Verify etcd is running before continuing
-        print_status "Verifying etcd is running on $controller_name..."
-        sleep 5
-        ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$controller_host "
-            if sudo systemctl is-active --quiet etcd; then
-                echo 'etcd is running successfully'
-                # Test etcd connectivity
-                sudo ETCDCTL_API=3 /usr/local/bin/etcdctl member list \
-                  --endpoints=https://127.0.0.1:2379 \
-                  --cacert=/etc/etcd/ca.pem \
-                  --cert=/etc/etcd/kubernetes.pem \
-                  --key=/etc/etcd/kubernetes-key.pem || echo 'etcd member list failed'
-            else
-                echo 'ERROR: etcd is not running!'
-                sudo journalctl -u etcd --lines=30 --no-pager
-                exit 1
-            fi
-        " || {
-            print_error "etcd setup failed on $controller_name"
-            exit 1
-        }
+
+    echo 'Starting etcd service...'
+    sudo systemctl daemon-reload
+    sudo systemctl enable etcd
+    sudo systemctl start etcd
+    sleep 5
+    
+    if ! sudo systemctl is-active --quiet etcd; then
+        echo 'ERROR: etcd failed to start'
+        sudo journalctl -u etcd --lines=20 --no-pager
+        exit 1
     fi
-done < inventory.ini
+    echo 'etcd is running successfully'
+    
+    echo 'Verifying etcd cluster health...'
+    sudo -u etcd /usr/local/bin/etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/etcd/ca.pem \
+        --cert=/etc/etcd/kubernetes.pem \
+        --key=/etc/etcd/kubernetes-key.pem \
+        member list
+    sudo -u etcd /usr/local/bin/etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/etcd/ca.pem \
+        --cert=/etc/etcd/kubernetes.pem \
+        --key=/etc/etcd/kubernetes-key.pem \
+        endpoint health
+" || {
+    print_error "Failed to set up etcd on controller-0 after retries"
+    exit 1
+}
 
 print_status "Waiting for etcd cluster to stabilize..."
-sleep 30
-
-# Verify etcd cluster health
-first_controller_host=$(grep "^controller-0" inventory.ini | cut -d' ' -f2 | cut -d'=' -f2)
-ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$first_controller_host "
-    echo 'Testing etcd cluster health:'
-    sudo ETCDCTL_API=3 /usr/local/bin/etcdctl endpoint health \
-      --endpoints=https://127.0.0.1:2379 \
-      --cacert=/etc/etcd/ca.pem \
-      --cert=/etc/etcd/kubernetes.pem \
-      --key=/etc/etcd/kubernetes-key.pem
-" || print_error "etcd cluster health check failed"
+sleep 10
 
 print_success "etcd cluster setup completed!"
 
@@ -1016,56 +1005,256 @@ EOF
 
 print_success "RBAC configuration completed!"
 
+# Step 8: Setting up worker nodes
 print_status "Step 8: Setting up worker nodes..."
 
-# Download and install worker binaries
+# Install binaries on workers
 run_on_workers "
+    set -e
+    echo 'Checking system resources...'
+    df -h /
+    free -m
+    if [ \$(df --output=avail / | tail -n 1) -lt 100000 ]; then
+        echo 'ERROR: Less than 100 MB free disk space on /'
+        exit 1
+    fi
+    if [ \$(free -m | awk '/^Mem:/ {print \$4}') -lt 100 ]; then
+        echo 'ERROR: Less than 100 MB free memory'
+        exit 1
+    fi
+
+    echo 'Installing required packages...'
     sudo apt-get update
-    sudo apt-get -y install socat conntrack ipset
+    sudo apt-get install -y socat conntrack ipset || {
+        echo 'ERROR: Failed to install packages'
+        exit 1
+    }
     
-    sudo mkdir -p /etc/cni/net.d /opt/cni/bin /var/lib/kubelet /var/lib/kube-proxy /var/lib/kubernetes /var/run/kubernetes
+    echo 'Installing CNI plugins...'
+    for attempt in {1..3}; do
+        wget -q --show-progress --https-only --timestamping \
+            \"https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz\" || {
+            echo \"CNI download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            sleep 5
+            if [ \$attempt -eq 3 ]; then
+                echo 'ERROR: Failed to download CNI plugins after 3 attempts'
+                exit 1
+            fi
+            continue
+        }
+        if [ ! -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz ]; then
+            echo 'ERROR: CNI tarball not found after download attempt \$attempt'
+            exit 1
+        fi
+        break
+    done
+    if ! file cni-plugins-linux-amd64-${CNI_VERSION}.tgz | grep -q 'gzip compressed data'; then
+        echo 'ERROR: Downloaded CNI tarball is invalid'
+        exit 1
+    fi
+    sudo mkdir -p /opt/cni/bin
+    sudo tar -xzf cni-plugins-linux-amd64-${CNI_VERSION}.tgz -C /opt/cni/bin/ || {
+        echo 'ERROR: Failed to extract CNI plugins'
+        exit 1
+    }
+    rm -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz
     
-    wget -q --https-only --timestamping \\
-      https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.28.0/crictl-v1.28.0-linux-amd64.tar.gz \\
-      https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.amd64 \\
-      https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz \\
-      https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz \\
-      https://storage.googleapis.com/kubernetes-release/release/${KUBERNETES_VERSION}/bin/linux/amd64/kubectl \\
-      https://storage.googleapis.com/kubernetes-release/release/${KUBERNETES_VERSION}/bin/linux/amd64/kube-proxy \\
-      https://storage.googleapis.com/kubernetes-release/release/${KUBERNETES_VERSION}/bin/linux/amd64/kubelet
+    echo 'Installing containerd...'
+    for attempt in {1..3}; do
+        wget -q --show-progress --https-only --timestamping \
+            \"https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz\" || {
+            echo \"Containerd download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            sleep 5
+            if [ \$attempt -eq 3 ]; then
+                echo 'ERROR: Failed to download containerd after 3 attempts'
+                exit 1
+            fi
+            continue
+        }
+        if [ ! -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz ]; then
+            echo 'ERROR: Containerd tarball not found after download attempt \$attempt'
+            exit 1
+        fi
+        break
+    done
+    if ! file containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
+        echo 'ERROR: Downloaded containerd tarball is invalid'
+        exit 1
+    fi
+    sudo tar -xzf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz -C /usr/local || {
+        echo 'ERROR: Failed to extract containerd'
+        exit 1
+    }
+    rm -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
     
-    # Install CNI plugins
-    sudo tar -xvf cni-plugins-linux-amd64-${CNI_VERSION}.tgz -C /opt/cni/bin/
+    echo 'Installing crictl...'
+    for attempt in {1..3}; do
+        wget -q --show-progress --https-only --timestamping \
+            \"https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz\" || {
+            echo \"crictl download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            sleep 5
+            if [ \$attempt -eq 3 ]; then
+                echo 'ERROR: Failed to download crictl after 3 attempts'
+                exit 1
+            fi
+            continue
+        }
+        if [ ! -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz ]; then
+            echo 'ERROR: crictl tarball not found after download attempt \$attempt'
+            exit 1
+        fi
+        break
+    done
+    if ! file crictl-${CRICTL_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
+        echo 'ERROR: Downloaded crictl tarball is invalid'
+        exit 1
+    fi
+    sudo tar -xzf crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -C /usr/local/bin/ || {
+        echo 'ERROR: Failed to extract crictl'
+        exit 1
+    }
+    rm -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
     
-    # Install containerd
-    sudo tar -xvf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz -C /
+    echo 'Installing kubelet...'
+    for attempt in {1..3}; do
+        wget -q --show-progress --https-only --timestamping \
+            \"https://dl.k8s.io/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet\" || {
+            echo \"kubelet download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            sleep 5
+            if [ \$attempt -eq 3 ]; then
+                echo 'ERROR: Failed to download kubelet after 3 attempts'
+                exit 1
+            fi
+            continue
+        }
+        if [ ! -f kubelet ]; then
+            echo 'ERROR: kubelet file not found after download attempt \$attempt'
+            exit 1
+        fi
+        break
+    done
+    if ! file kubelet | grep -q 'ELF 64-bit LSB executable'; then
+        echo 'ERROR: Downloaded kubelet binary is invalid'
+        rm -f kubelet
+        exit 1
+    fi
+    sudo mv kubelet /usr/local/bin/kubelet || {
+        echo 'ERROR: Failed to move kubelet to /usr/local/bin/'
+        rm -f kubelet
+        exit 1
+    }
+    sudo chmod +x /usr/local/bin/kubelet
+    echo 'Verifying kubelet installation...'
+    if ! /usr/local/bin/kubelet --version; then
+        echo 'ERROR: kubelet binary is not executable or invalid'
+        exit 1
+    fi
     
-    # Install runc
-    sudo mv runc.amd64 runc
-    chmod +x runc kubectl kube-proxy kubelet
-    sudo mv runc /usr/local/bin/
-    sudo mv kubectl kube-proxy kubelet /usr/local/bin/
-    
-    # Extract and install crictl
-    tar -xvf crictl-v1.28.0-linux-amd64.tar.gz
-    sudo mv crictl /usr/local/bin/
-"
+    echo 'Listing installed binaries...'
+    ls -la /opt/cni/bin
+    ls -la /usr/local/bin
+" || {
+    print_error "Failed to install binaries on workers"
+    exit 1
+}
 
-# Configure containerd on workers
-run_on_workers "
-    sudo mkdir -p /etc/containerd/
-    
-    sudo tee /etc/containerd/config.toml > /dev/null <<EOF
-[plugins]
-  [plugins.cri.containerd]
-    snapshotter = \"overlayfs\"
-    [plugins.cri.containerd.default_runtime]
-      runtime_type = \"io.containerd.runc.v2\"
-      runtime_engine = \"/usr/local/bin/runc\"
-      runtime_root = \"\"
+# Configure kubelet and kube-proxy on each worker
+while IFS= read -r line; do
+    if [[ $line =~ ^worker- ]]; then
+        worker_name=$(echo $line | cut -d' ' -f1)
+        worker_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
+        worker_private_ip=$(echo $line | cut -d' ' -f3 | cut -d'=' -f2)
+        pod_cidr=$(echo $line | grep -o 'pod_cidr=[^ ]*' | cut -d'=' -f2 || echo "10.200.${worker_name: -1}.0/24")
+        
+        print_status "Configuring kubelet on $worker_name ($worker_host)"
+
+        # Debug: List available files in certs/ and kubeconfigs/
+        echo "Available files in certs/:"
+        ls -l certs/ || echo "certs/ directory not found"
+        echo "Available files in kubeconfigs/:"
+        ls -l kubeconfigs/ || echo "kubeconfigs/ directory not found"
+
+        # Check for required files
+        if [ ! -f "certs/${worker_name}.kubeconfig" ] && [ ! -f "kubeconfigs/${worker_name}.kubeconfig" ]; then
+            echo "ERROR: Kubeconfig file for ${worker_name} not found in certs/ or kubeconfigs/"
+            exit 1
+        fi
+        if [ ! -f "certs/kube-proxy.kubeconfig" ] && [ ! -f "kubeconfigs/kube-proxy.kubeconfig" ]; then
+            echo "ERROR: kube-proxy kubeconfig file not found in certs/ or kubeconfigs/"
+            exit 1
+        fi
+        if [ ! -f "certs/ca.pem" ]; then
+            echo "ERROR: ca.pem not found in certs/"
+            exit 1
+        fi
+        if [ ! -f "certs/${worker_name}.pem" ]; then
+            echo "ERROR: ${worker_name}.pem not found in certs/"
+            exit 1
+        fi
+        if [ ! -f "certs/${worker_name}-key.pem" ]; then
+            echo "ERROR: ${worker_name}-key.pem not found in certs/"
+            exit 1
+        fi
+
+        # Use kubeconfigs/ if certs/${worker_name}.kubeconfig doesn't exist
+        kubelet_kubeconfig_path="certs/${worker_name}.kubeconfig"
+        kube_proxy_kubeconfig_path="certs/kube-proxy.kubeconfig"
+        if [ -f "kubeconfigs/${worker_name}.kubeconfig" ]; then
+            kubelet_kubeconfig_path="kubeconfigs/${worker_name}.kubeconfig"
+        fi
+        if [ -f "kubeconfigs/kube-proxy.kubeconfig" ]; then
+            kube_proxy_kubeconfig_path="kubeconfigs/kube-proxy.kubeconfig"
+        fi
+
+        # Base64-encode certificates and configs
+        ca_pem=$(base64 -w 0 < certs/ca.pem)
+        worker_pem=$(base64 -w 0 < certs/${worker_name}.pem)
+        worker_key_pem=$(base64 -w 0 < certs/${worker_name}-key.pem)
+        kubelet_kubeconfig=$(base64 -w 0 < "$kubelet_kubeconfig_path")
+        kube_proxy_kubeconfig=$(base64 -w 0 < "$kube_proxy_kubeconfig_path")
+        
+        ssh -F ssh_config -o ConnectTimeout=60 -o StrictHostKeyChecking=no -v $worker_name "
+            set -e
+            # Create directories
+            sudo mkdir -p /var/lib/kubelet /var/lib/kube-proxy /var/lib/kubernetes /etc/cni/net.d /etc/systemd/system /etc/containerd
+
+            # Get actual node name from hostname
+            node_name=\$(hostname)
+            echo \"Detected node name: \$node_name\"
+
+            # Copy certificates and configs
+            echo '$ca_pem' | base64 -d | sudo tee /var/lib/kubernetes/ca.pem > /dev/null
+            echo '$worker_pem' | base64 -d | sudo tee /var/lib/kubelet/${worker_name}.pem > /dev/null
+            echo '$worker_key_pem' | base64 -d | sudo tee /var/lib/kubelet/${worker_name}-key.pem > /dev/null
+            echo '$kubelet_kubeconfig' | base64 -d | sudo tee /var/lib/kubelet/kubeconfig > /dev/null
+            echo '$kube_proxy_kubeconfig' | base64 -d | sudo tee /var/lib/kube-proxy/kubeconfig > /dev/null
+
+            # Fix kubeconfig node name to match actual hostname
+            sudo sed -i \"s/system:node:${worker_name}/system:node:\$node_name/g\" /var/lib/kubelet/kubeconfig
+            sudo sed -i \"s/system:node:worker-0/system:node:\$node_name/g\" /var/lib/kubelet/kubeconfig
+
+            # Verify kubeconfig
+            echo 'Verifying kubeconfig...'
+            sudo grep \"user: system:node:\$node_name\" /var/lib/kubelet/kubeconfig || {
+                echo 'ERROR: Failed to update kubeconfig node name'
+                exit 1
+            }
+
+            # Verify certificates
+            echo 'Verifying certificates in /var/lib/kubelet/ and /var/lib/kubernetes/:'
+            ls -la /var/lib/kubelet/ /var/lib/kubernetes/
+            
+            # Create containerd config
+            sudo tee /etc/containerd/config.toml > /dev/null <<EOF
+[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]
+  [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]
+    SystemdCgroup = true
 EOF
+            echo 'Verifying containerd config...'
+            ls -l /etc/containerd/
 
-    sudo tee /etc/systemd/system/containerd.service > /dev/null <<EOF
+            # Create containerd service
+            sudo tee /etc/systemd/system/containerd.service > /dev/null <<EOF
 [Unit]
 Description=containerd container runtime
 Documentation=https://containerd.io
@@ -1073,37 +1262,22 @@ After=network.target
 
 [Service]
 ExecStartPre=/sbin/modprobe overlay
-ExecStart=/bin/containerd
+ExecStart=/usr/local/bin/containerd
 Restart=always
 RestartSec=5
 Delegate=yes
 KillMode=process
-OOMScoreAdjust=-999
+OOMScoreAdjust=-500
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
-TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
-"
+            echo 'Verifying containerd service file...'
+            ls -l /etc/systemd/system/containerd.service
 
-# Configure kubelet on each worker
-while IFS= read -r line; do
-    if [[ $line =~ ^worker- ]]; then
-        worker_name=$(echo $line | cut -d' ' -f1)
-        worker_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
-        worker_private_ip=$(echo $line | cut -d' ' -f3 | cut -d'=' -f2)
-        pod_cidr="10.200.${worker_name: -1}.0/24"  # Generate pod CIDR based on worker index
-        
-        print_status "Configuring kubelet on $worker_name"
-        
-        ssh -F ssh_config -o StrictHostKeyChecking=no ubuntu@$worker_host "
-            # Verify certificates were copied correctly
-            echo 'Verifying certificates in /var/lib/kubelet/:'
-            ls -la /var/lib/kubelet/
-            
             # Create kubelet config
             sudo tee /var/lib/kubelet/kubelet-config.yaml > /dev/null <<EOF
 kind: KubeletConfiguration
@@ -1125,6 +1299,7 @@ resolvConf: \"/run/systemd/resolve/resolv.conf\"
 runtimeRequestTimeout: \"15m\"
 tlsCertFile: \"/var/lib/kubelet/${worker_name}.pem\"
 tlsPrivateKeyFile: \"/var/lib/kubelet/${worker_name}-key.pem\"
+cgroupDriver: \"systemd\"
 EOF
 
             # Create kubelet service
@@ -1136,11 +1311,12 @@ After=containerd.service
 Requires=containerd.service
 
 [Service]
-ExecStart=/usr/local/bin/kubelet \\\\
-  --config=/var/lib/kubelet/kubelet-config.yaml \\\\
-  --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \\\\
-  --kubeconfig=/var/lib/kubelet/kubeconfig \\\\
-  --register-node=true \\\\
+ExecStart=/usr/local/bin/kubelet \\
+  --config=/var/lib/kubelet/kubelet-config.yaml \\
+  --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \\
+  --kubeconfig=/var/lib/kubelet/kubeconfig \\
+  --register-node=true \\
+  --node-ip=${worker_private_ip} \\
   --v=2
 Restart=on-failure
 RestartSec=5
@@ -1160,13 +1336,14 @@ mode: \"iptables\"
 clusterCIDR: \"10.200.0.0/16\"
 EOF
 
+            # Create kube-proxy service
             sudo tee /etc/systemd/system/kube-proxy.service > /dev/null <<EOF
 [Unit]
 Description=Kubernetes Kube Proxy
 Documentation=https://github.com/kubernetes/kubernetes
 
 [Service]
-ExecStart=/usr/local/bin/kube-proxy \\\\
+ExecStart=/usr/local/bin/kube-proxy \\
   --config=/var/lib/kube-proxy/kube-proxy-config.yaml
 Restart=on-failure
 RestartSec=5
@@ -1192,7 +1369,7 @@ EOF
             echo 'containerd started successfully'
             
             echo 'Starting kubelet...'
-            sudo systemctl start kubelet
+            sudo systemctl restart kubelet
             sleep 10
             
             if ! sudo systemctl is-active --quiet kubelet; then
@@ -1221,10 +1398,36 @@ EOF
     fi
 done < inventory.ini
 
-print_status "Waiting for worker nodes to register..."
-sleep 30
+# Apply RBAC for node registration
+print_status "Applying RBAC for node registration..."
+kubectl --kubeconfig=admin.kubeconfig apply -f - <<EOF
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: system:node
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["create", "get", "list", "watch", "update", "patch"]
+- apiGroups: [""]
+  resources: ["nodes/status"]
+  verbs: ["update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: system:node
+subjects:
+- kind: Group
+  name: system:nodes
+  apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: system:node
+  apiGroup: rbac.authorization.k8s.io
+EOF
 
-print_success "Worker nodes setup completed!"
+print_success "Worker node setup completed!"
 
 print_status "Step 9: Configuring kubectl for remote access..."
 
@@ -1250,49 +1453,89 @@ kubectl config use-context kubernetes-the-hard-way --kubeconfig=admin.kubeconfig
 
 print_success "Admin kubeconfig created: admin.kubeconfig"
 
+# Step 10: Installing Pod network (Weave Net)
 print_status "Step 10: Installing Pod network (Weave Net)..."
 
-# Wait for nodes to be ready before installing network
+# Ensure DNS resolution
+run_on_controllers "
+    set -e
+    echo 'Fixing DNS resolution...'
+    sudo bash -c 'echo \"nameserver 8.8.8.8\" > /etc/resolv.conf'
+    if ! nslookup cloud.weave.works >/dev/null; then
+        echo 'ERROR: DNS resolution for cloud.weave.works failed'
+        exit 1
+    fi
+" || {
+    print_error "Failed to configure DNS on controllers"
+    exit 1
+}
+
+# Wait for nodes to be ready
 print_status "Waiting for nodes to be ready..."
-for i in {1..20}; do
-    if kubectl --kubeconfig=admin.kubeconfig get nodes 2>/dev/null | grep -q "Ready\|NotReady"; then
-        print_status "Nodes are registering, proceeding with network installation..."
+for attempt in {1..30}; do
+    print_status "Waiting for nodes to register... (attempt $attempt/30)"
+    nodes_ready=$(kubectl --kubeconfig=admin.kubeconfig get nodes -o jsonpath='{.items[?(@.status.conditions[-1].type=="Ready")].status.conditions[-1].status}' | grep -c True || true)
+    if [ "$nodes_ready" -ge 2 ]; then
+        print_status "All worker nodes are ready!"
         break
     fi
-    print_status "Waiting for nodes to register... (attempt $i/20)"
-    sleep 15
+    if [ $attempt -eq 30 ]; then
+        print_error "Worker nodes failed to register after 15 minutes"
+        kubectl --kubeconfig=admin.kubeconfig get nodes -o wide
+        for node in worker-0 worker-1; do
+            ssh -F ssh_config -o ConnectTimeout=10 -o StrictHostKeyChecking=no $node "
+                echo 'Checking kubelet status on $node...'
+                sudo systemctl status kubelet --no-pager
+                sudo journalctl -u kubelet --no-pager -n 50
+                echo 'Checking API server connectivity...'
+                curl -k https://${KUBERNETES_PUBLIC_ADDRESS}:6443 || echo 'Failed to connect to API server'
+            "
+        done
+        exit 1
+    fi
+    sleep 30
 done
 
-# Install pod network with correct CIDR range
-kubectl --kubeconfig=admin.kubeconfig apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl --kubeconfig=admin.kubeconfig version | base64 | tr -d '\n')&env.IPALLOC_RANGE=10.200.0.0/16" || {
-    print_error "Failed to install Weave network"
-    # Try alternative method
+# Install Weave Net
+print_status "Installing Weave Net..."
+kubectl --kubeconfig=admin.kubeconfig apply -f https://cloud.weave.works/k8s/net?k8s-version=v1.28.3 || {
     print_status "Trying alternative Weave installation..."
     kubectl --kubeconfig=admin.kubeconfig apply -f https://github.com/weaveworks/weave/releases/download/v2.8.1/weave-daemonset-k8s.yaml || {
-        print_error "Alternative Weave installation also failed"
+        print_error "Failed to install Weave network"
+        exit 1
     }
 }
 
+# Wait for Weave Net pods to be ready
 print_status "Waiting for pod network to be ready..."
-sleep 60
+for attempt in {1..10}; do
+    pods_ready=$(kubectl --kubeconfig=admin.kubeconfig get pods -n kube-system -l name=weave-net -o jsonpath='{.items[?(@.status.phase=="Running")].status.phase}' | grep -c Running || true)
+    if [ "$pods_ready" -ge 2 ]; then
+        print_status "Weave Net pods are ready!"
+        break
+    fi
+    if [ $attempt -eq 10 ]; then
+        print_error "Weave Net pods failed to start after 5 minutes"
+        kubectl --kubeconfig=admin.kubeconfig get pods -n kube-system -o wide
+        kubectl --kubeconfig=admin.kubeconfig get events -n kube-system
+        exit 1
+    fi
+    sleep 30
+done
 
+# Final verification
 print_status "Final verification..."
-
-# Test the cluster
 print_status "Getting cluster nodes..."
-kubectl --kubeconfig=admin.kubeconfig get nodes -o wide || print_error "Failed to get nodes"
-
+kubectl --kubeconfig=admin.kubeconfig get nodes -o wide
 print_status "Getting cluster pods..."
-kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces || print_error "Failed to get pods"
-
+kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces -o wide
 print_status "Getting cluster component status..."
-kubectl --kubeconfig=admin.kubeconfig get componentstatuses || print_error "Failed to get component status"
+kubectl --kubeconfig=admin.kubeconfig get componentstatuses
 
 print_success "Kubernetes The Hard Way setup completed successfully!"
 print_success "Use 'kubectl --kubeconfig=admin.kubeconfig' to interact with your cluster"
 print_success "Or copy admin.kubeconfig to ~/.kube/config to use kubectl normally"
-
-echo -e "${GREEN}"
+echo
 echo "=============================================="
 echo "  Kubernetes The Hard Way Setup Complete!"
 echo "=============================================="
@@ -1300,14 +1543,14 @@ echo "Cluster endpoint: https://${KUBERNETES_PUBLIC_ADDRESS}:6443"
 echo "Admin kubeconfig: admin.kubeconfig"
 echo "SSH config: ssh_config"
 echo "Private key: k8s-key.pem"
-echo ""
+echo
 echo "Quick test commands:"
 echo "  kubectl --kubeconfig=admin.kubeconfig get nodes"
 echo "  kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces"
 echo "  kubectl --kubeconfig=admin.kubeconfig cluster-info"
-echo ""
+echo
 echo "To use kubectl without --kubeconfig flag:"
-echo "  export KUBECONFIG=\$PWD/admin.kubeconfig"
+echo "  export KUBECONFIG=$PWD/admin.kubeconfig"
 echo "  # OR"
 echo "  cp admin.kubeconfig ~/.kube/config"
 echo "=============================================="

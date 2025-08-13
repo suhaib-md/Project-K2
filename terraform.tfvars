@@ -16,5 +16,5 @@ common_tags = {
   Project     = "kubernetes-the-hard-way"
   Environment = "learning"
   ManagedBy   = "terraform"
-  Owner       = "your-name"
+  Owner       = "suhaib"
 }
