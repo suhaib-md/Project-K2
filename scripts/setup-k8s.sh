@@ -436,7 +436,7 @@ kubectl config use-context default --kubeconfig=kubeconfigs/kube-scheduler.kubec
 kubectl config set-cluster kubernetes-the-hard-way \
   --certificate-authority=certs/ca.pem \
   --embed-certs=true \
-  --server=https://127.0.0.1:6443 \
+  --server=https://${KUBERNETES_PUBLIC_ADDRESS}:6443 \
   --kubeconfig=kubeconfigs/admin.kubeconfig
 
 kubectl config set-credentials admin \
@@ -1013,6 +1013,7 @@ run_on_workers "
     set -e
     echo 'Checking system resources...'
     df -h /
+    lsblk
     free -m
     if [ \$(df --output=avail / | tail -n 1) -lt 100000 ]; then
         echo 'ERROR: Less than 100 MB free disk space on /'
@@ -1022,6 +1023,41 @@ run_on_workers "
         echo 'ERROR: Less than 100 MB free memory'
         exit 1
     fi
+
+    echo 'Updating CA certificates...'
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates
+    sudo update-ca-certificates || {
+        echo 'ERROR: Failed to update CA certificates'
+        exit 1
+    }
+
+    echo 'Checking network connectivity to dl.k8s.io...'
+    primary_url=\"https://dl.k8s.io/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet\"
+    fallback_url=\"https://storage.googleapis.com/kubernetes-release/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet\"
+    selected_url=\"\$primary_url\"
+    for attempt in {1..5}; do
+        echo \"Attempt \$attempt/5 to reach \$selected_url...\"
+        http_status=\$(curl -s -L -w \"%{http_code}\" \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt -o /dev/null)
+        if [ \"\$http_status\" -eq 200 ]; then
+            echo \"Successfully reached \$selected_url (HTTP \$http_status)\"
+            break
+        else
+            echo \"Failed to reach \$selected_url (HTTP \$http_status)\"
+            curl -v -L -s \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt 2>&1 | grep -E 'Connected to|Could not resolve|Failed to connect|SSL|HTTP'
+            echo 'Checking DNS resolution...'
+            nslookup dl.k8s.io || echo 'DNS resolution failed'
+            if [ \$attempt -eq 3 ] && [ \"\$selected_url\" = \"\$primary_url\" ]; then
+                echo 'Switching to fallback URL: \$fallback_url'
+                selected_url=\"\$fallback_url\"
+            fi
+            if [ \$attempt -eq 5 ]; then
+                echo \"ERROR: Cannot reach \$selected_url after 5 attempts (HTTP \$http_status)\"
+                exit 1
+            fi
+            sleep 10
+        fi
+    done
 
     echo 'Installing required packages...'
     sudo apt-get update
@@ -1118,7 +1154,7 @@ run_on_workers "
     echo 'Installing kubelet...'
     for attempt in {1..3}; do
         wget -q --show-progress --https-only --timestamping \
-            \"https://dl.k8s.io/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet\" || {
+            \"\$selected_url\" || {
             echo \"kubelet download attempt \$attempt/3 failed, retrying in 5 seconds...\"
             sleep 5
             if [ \$attempt -eq 3 ]; then
@@ -1168,6 +1204,12 @@ while IFS= read -r line; do
         
         print_status "Configuring kubelet on $worker_name ($worker_host)"
 
+        # Debug: Test SSH connectivity
+        ssh -F ssh_config -o ConnectTimeout=10 -o StrictHostKeyChecking=no $worker_name "echo 'SSH connection successful for $worker_name'" || {
+            print_error "Failed to SSH to $worker_name ($worker_host)"
+            exit 1
+        }
+
         # Debug: List available files in certs/ and kubeconfigs/
         echo "Available files in certs/:"
         ls -l certs/ || echo "certs/ directory not found"
@@ -1175,12 +1217,12 @@ while IFS= read -r line; do
         ls -l kubeconfigs/ || echo "kubeconfigs/ directory not found"
 
         # Check for required files
-        if [ ! -f "certs/${worker_name}.kubeconfig" ] && [ ! -f "kubeconfigs/${worker_name}.kubeconfig" ]; then
-            echo "ERROR: Kubeconfig file for ${worker_name} not found in certs/ or kubeconfigs/"
+        if [ ! -f "kubeconfigs/${worker_name}.kubeconfig" ]; then
+            echo "ERROR: Kubeconfig file for ${worker_name} not found in kubeconfigs/"
             exit 1
         fi
-        if [ ! -f "certs/kube-proxy.kubeconfig" ] && [ ! -f "kubeconfigs/kube-proxy.kubeconfig" ]; then
-            echo "ERROR: kube-proxy kubeconfig file not found in certs/ or kubeconfigs/"
+        if [ ! -f "kubeconfigs/kube-proxy.kubeconfig" ]; then
+            echo "ERROR: kube-proxy kubeconfig file not found in kubeconfigs/"
             exit 1
         fi
         if [ ! -f "certs/ca.pem" ]; then
@@ -1196,22 +1238,12 @@ while IFS= read -r line; do
             exit 1
         fi
 
-        # Use kubeconfigs/ if certs/${worker_name}.kubeconfig doesn't exist
-        kubelet_kubeconfig_path="certs/${worker_name}.kubeconfig"
-        kube_proxy_kubeconfig_path="certs/kube-proxy.kubeconfig"
-        if [ -f "kubeconfigs/${worker_name}.kubeconfig" ]; then
-            kubelet_kubeconfig_path="kubeconfigs/${worker_name}.kubeconfig"
-        fi
-        if [ -f "kubeconfigs/kube-proxy.kubeconfig" ]; then
-            kube_proxy_kubeconfig_path="kubeconfigs/kube-proxy.kubeconfig"
-        fi
-
         # Base64-encode certificates and configs
         ca_pem=$(base64 -w 0 < certs/ca.pem)
         worker_pem=$(base64 -w 0 < certs/${worker_name}.pem)
         worker_key_pem=$(base64 -w 0 < certs/${worker_name}-key.pem)
-        kubelet_kubeconfig=$(base64 -w 0 < "$kubelet_kubeconfig_path")
-        kube_proxy_kubeconfig=$(base64 -w 0 < "$kube_proxy_kubeconfig_path")
+        kubelet_kubeconfig=$(base64 -w 0 < kubeconfigs/${worker_name}.kubeconfig)
+        kube_proxy_kubeconfig=$(base64 -w 0 < kubeconfigs/kube-proxy.kubeconfig)
         
         ssh -F ssh_config -o ConnectTimeout=60 -o StrictHostKeyChecking=no -v $worker_name "
             set -e
@@ -1400,7 +1432,11 @@ done < inventory.ini
 
 # Apply RBAC for node registration
 print_status "Applying RBAC for node registration..."
-kubectl --kubeconfig=admin.kubeconfig apply -f - <<EOF
+if [ ! -f "kubeconfigs/admin.kubeconfig" ]; then
+    print_error "kubeconfigs/admin.kubeconfig not found"
+    exit 1
+fi
+kubectl --kubeconfig=kubeconfigs/admin.kubeconfig apply -f - <<EOF
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
