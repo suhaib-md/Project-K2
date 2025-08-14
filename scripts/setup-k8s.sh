@@ -68,6 +68,32 @@ run_on_workers() {
     done < inventory.ini
 }
 
+# Function to run commands on multiple nodes
+run_on_nodes() {
+    local nodes="$1"
+    local cmd="$2"
+    for node in $nodes; do
+        print_status "Running command on $node..."
+        success=false
+        for retry in {1..3}; do
+            print_status "Attempt $retry/3 for $node..."
+            if ssh -F ssh_config -o ConnectTimeout=60 -o StrictHostKeyChecking=no -v $node "$cmd" >> /tmp/${node}-install.log 2>&1; then
+                success=true
+                print_success "Command executed on $node"
+                break
+            else
+                print_error "Failed to run command on $node (attempt $retry), retrying in 30 seconds..."
+                sleep 30
+            fi
+        done
+        if [ "$success" = false ]; then
+            print_error "Failed to run command on $node after 3 attempts"
+            cat /tmp/${node}-install.log
+            exit 1
+        fi
+    done
+}
+
 # Create certificates directory
 mkdir -p certs
 cd certs
@@ -1006,339 +1032,140 @@ EOF
 
 print_success "RBAC configuration completed!"
 
-# Step 8: Setting up worker nodes
-print_status "Step 8: Setting up worker nodes..."
-
-# Install binaries on workers
-run_on_workers "
+# Step 8: Install worker dependencies
+print_status "Step 8: Installing worker dependencies..."
+run_on_workers="
     set -e
-    # Debug: Dump script to file for syntax checking
-    echo 'Dumping script to /tmp/worker-script.sh for debugging...'
-    cat > /tmp/worker-script.sh <<'END_OF_SCRIPT'
-    set -e
-    echo 'Checking system resources...'
-    df -h /
-    lsblk
-    free -m
-    if [ \$(df --output=avail / | tail -n 1) -lt 100000 ]; then
-        echo 'ERROR: Less than 100 MB free disk space on /'
-        exit 1
-    fi
-    if [ \$(free -m | awk '/^Mem:/ {print \$4}') -lt 100 ]; then
-        echo 'ERROR: Less than 100 MB free memory'
-        exit 1
-    fi
+    echo 'Starting worker installation at \$(date)' > /tmp/worker-install.log
+    echo 'Worker: \$(hostname)' >> /tmp/worker-install.log
 
-    echo 'Updating CA certificates...'
-    sudo apt-get update
-    sudo apt-get install -y ca-certificates
-    sudo update-ca-certificates || {
-        echo 'ERROR: Failed to update CA certificates'
-        exit 1
-    }
+    # Install prerequisites
+    echo 'Installing prerequisites...' >> /tmp/worker-install.log
+    sudo apt-get update >> /tmp/worker-install.log 2>&1
+    sudo apt-get install -y socat conntrack ipset >> /tmp/worker-install.log 2>&1 || { echo 'ERROR: Failed to install prerequisites' >> /tmp/worker-install.log; exit 1; }
 
-    echo 'Checking network connectivity to dl.k8s.io...'
-    primary_url='https://dl.k8s.io/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet'
-    fallback_url='https://storage.googleapis.com/kubernetes-release/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet'
-    selected_url=\"\$primary_url\"
-    for attempt in {1..5}; do
-        echo \"Attempt \$attempt/5 to reach \$selected_url...\"
-        http_status=\$(curl -s -L -w '%{http_code}' \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt -o /dev/null)
-        if [ \"\$http_status\" -eq 200 ]; then
-            echo \"Successfully reached \$selected_url (HTTP \$http_status)\"
-            break
-        else
-            echo \"Failed to reach \$selected_url (HTTP \$http_status)\"
-            curl -v -L -s \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt 2>&1 | grep -E 'Connected to|Could not resolve|Failed to connect|SSL|HTTP'
-            echo 'Checking DNS resolution...'
-            nslookup dl.k8s.io || echo 'DNS resolution failed'
-            if [ \$attempt -eq 3 ] && [ \"\$selected_url\" = \"\$primary_url\" ]; then
-                echo \"Switching to fallback URL: \$fallback_url\"
-                selected_url=\"\$fallback_url\"
-            fi
-            if [ \$attempt -eq 5 ]; then
-                echo \"ERROR: Cannot reach \$selected_url after 5 attempts (HTTP \$http_status)\"
-                exit 1
-            fi
-            sleep 10
-        fi
-    done
-
-    echo 'Installing required packages...'
-    sudo apt-get update
-    sudo apt-get install -y socat conntrack ipset || {
-        echo 'ERROR: Failed to install packages'
-        exit 1
-    }
-
-    echo 'Installing CNI plugins...'
+    # Install containerd
+    echo 'Installing containerd...' >> /tmp/worker-install.log
     for attempt in {1..3}; do
-        if wget -q --show-progress --https-only --timestamping \"https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz\"; then
-            echo \"CNI plugins download successful on attempt \$attempt\"
+        echo \"Attempt \$attempt/3 to download containerd...\" >> /tmp/worker-install.log
+        if wget -q --show-progress --https-only --timestamping 'https://github.com/containerd/containerd/releases/download/v1.7.3/containerd-1.7.3-linux-amd64.tar.gz' 2>> /tmp/worker-install.log; then
+            echo \"containerd download successful on attempt \$attempt\" >> /tmp/worker-install.log
             break
         else
-            echo \"CNI download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            echo \"containerd download attempt \$attempt/3 failed, retrying in 5 seconds...\" >> /tmp/worker-install.log
             sleep 5
-            [ \$attempt -eq 3 ] && { echo 'ERROR: Failed to download CNI plugins after 3 attempts'; exit 1; }
-            continue
+            [ \"\$attempt\" -eq 3 ] && { echo 'ERROR: Failed to download containerd after 3 attempts' >> /tmp/worker-install.log; exit 1; }
         fi
     done
-    [ -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz ] || { echo 'ERROR: CNI tarball not found'; exit 1; }
-    if ! file cni-plugins-linux-amd64-${CNI_VERSION}.tgz | grep -q 'gzip compressed data'; then
-        echo 'ERROR: Downloaded CNI tarball is invalid'
-        exit 1
-    fi
-    sudo mkdir -p /opt/cni/bin
-    sudo tar -xzf cni-plugins-linux-amd64-${CNI_VERSION}.tgz -C /opt/cni/bin/ || {
-        echo 'ERROR: Failed to extract CNI plugins'
-        exit 1
-    }
-    rm -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz
+    [ -f containerd-1.7.3-linux-amd64.tar.gz ] || { echo 'ERROR: containerd tarball not found' >> /tmp/worker-install.log; exit 1; }
+    sudo tar -xzf containerd-1.7.3-linux-amd64.tar.gz -C /usr/local >> /tmp/worker-install.log 2>&1 || { echo 'ERROR: Failed to extract containerd' >> /tmp/worker-install.log; exit 1; }
+    rm -f containerd-1.7.3-linux-amd64.tar.gz
+    echo 'containerd installed' >> /tmp/worker-install.log
+    /usr/local/bin/containerd --version >> /tmp/worker-install.log
 
-    echo 'Installing runc...'
-    for attempt in {1..5}; do
-        echo "Attempt $attempt/5 to download runc..."
-        primary_url='https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.amd64'
-        checksum_url='https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.sha256sum'
-        
-        if wget -q --show-progress --https-only --timestamping "$primary_url" -O runc.amd64; then
-            echo "runc download successful on attempt $attempt"
-        else
-            echo "runc download attempt $attempt/5 failed, retrying in 5 seconds..."
-            wget -v -O /dev/null "$primary_url" 2>&1 | grep -E 'ERROR|failed' || true
-            sleep 5
-            [ "$attempt" -eq 5 ] && { echo "ERROR: Failed to download runc after 5 attempts"; exit 1; }
-            continue
-        fi
-        
-        [ -f runc.amd64 ] || { echo "ERROR: runc binary not found after download attempt $attempt"; exit 1; }
-        
-        echo 'Downloading runc checksum...'
-        if wget -q --https-only --timestamping "$checksum_url" -O runc.sha256sum; then
-            echo 'Verifying runc checksum...'
-            if grep runc.amd64 runc.sha256sum | sha256sum -c; then
-                echo 'runc checksum verified'
-                rm -f runc.sha256sum
-            else
-                echo 'ERROR: runc checksum verification failed'
-                rm -f runc.amd64 runc.sha256sum
-                [ "$attempt" -eq 5 ] && { echo "ERROR: Checksum verification failed after 5 attempts"; exit 1; }
-                continue
-            fi
-        else
-            echo "WARNING: Failed to download checksum, skipping for attempt $attempt"
-        fi
-        
-        echo 'Verifying runc binary format...'
-        chmod +x runc.amd64 || { echo "ERROR: Failed to set execute permissions on runc.amd64"; exit 1; }
-        echo "File type: $(file runc.amd64)"
-        echo "Library dependencies: $(ldd runc.amd64 2>&1 || echo 'ldd failed')"
-        if file runc.amd64 | grep -q 'ELF 64-bit LSB \(executable\|shared object\)'; then
-            echo 'runc binary is valid ELF 64-bit executable or shared object'
-            if ./runc.amd64 --version 2>/dev/null | grep -q 'runc version'; then
-                echo 'runc binary is executable'
-                break
-            else
-                echo 'ERROR: runc binary is not executable'
-                ldd runc.amd64 || echo 'ldd failed'
-                rm -f runc.amd64
-                [ "$attempt" -eq 5 ] && { echo "ERROR: runc binary validation failed after 5 attempts"; exit 1; }
-                continue
-            fi
-        else
-            echo 'ERROR: Downloaded runc binary is invalid'
-            file runc.amd64 || echo 'file command failed'
-            rm -f runc.amd64
-            [ "$attempt" -eq 5 ] && { echo "ERROR: runc binary validation failed after 5 attempts"; exit 1; }
-            continue
-        fi
-    done
-    
-    sudo install -m 0755 runc.amd64 /usr/local/bin/runc || { echo 'ERROR: Failed to install runc to /usr/local/bin/'; rm -f runc.amd64; exit 1; }
-    rm -f runc.amd64
-    echo 'Verifying runc installation...'
-    if ! /usr/local/bin/runc --version; then
-        echo 'ERROR: runc binary is not executable or invalid'
-        ldd /usr/local/bin/runc || echo 'ldd failed'
-        exit 1
-    fi
-    echo 'runc installed successfully'
-
-    echo 'Installing containerd...' | tee -a /tmp/containerd-install.log
+    # Install runc
+    echo 'Installing runc...' >> /tmp/worker-install.log
     for attempt in {1..3}; do
-        echo "Attempt $attempt/3 to download containerd..." | tee -a /tmp/containerd-install.log
-        if wget -q --show-progress --https-only --timestamping "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" 2>> /tmp/containerd-install.log; then
-            echo "containerd download successful on attempt $attempt" | tee -a /tmp/containerd-install.log
+        echo \"Attempt \$attempt/3 to download runc...\" >> /tmp/worker-install.log
+        if wget -q --show-progress --https-only --timestamping 'https://github.com/opencontainers/runc/releases/download/v1.1.12/runc.amd64' 2>> /tmp/worker-install.log; then
+            echo \"runc download successful on attempt \$attempt\" >> /tmp/worker-install.log
             break
         else
-            echo "containerd download attempt $attempt/3 failed, retrying in 5 seconds..." | tee -a /tmp/containerd-install.log
-            wget -v -O /dev/null "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" 2>> /tmp/containerd-install.log || true
+            echo \"runc download attempt \$attempt/3 failed, retrying in 5 seconds...\" >> /tmp/worker-install.log
             sleep 5
-            [ "$attempt" -eq 3 ] && { echo "ERROR: Failed to download containerd after 3 attempts" | tee -a /tmp/containerd-install.log; exit 1; }
-            continue
+            [ \"\$attempt\" -eq 3 ] && { echo 'ERROR: Failed to download runc after 3 attempts' >> /tmp/worker-install.log; exit 1; }
         fi
     done
-    [ -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz ] || { echo "ERROR: containerd tarball not found" | tee -a /tmp/containerd-install.log; exit 1; }
-    echo "Verifying containerd tarball..." | tee -a /tmp/containerd-install.log
-    if ! file containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
-        echo "ERROR: Downloaded containerd tarball is invalid" | tee -a /tmp/containerd-install.log
-        rm -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
-        exit 1
-    fi
-    echo "Inspecting containerd tarball contents..." | tee -a /tmp/containerd-install.log
-    tar -tzf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz >> /tmp/containerd-install.log 2>&1 || { echo "ERROR: Failed to inspect containerd tarball" | tee -a /tmp/containerd-install.log; exit 1; }
-    echo "Extracting containerd tarball..." | tee -a /tmp/containerd-install.log
-    sudo mkdir -p /usr/local/bin
-    mkdir -p /tmp/containerd-extract
-    sudo tar -xzf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz -C /tmp/containerd-extract >> /tmp/containerd-install.log 2>&1 || {
-        echo "ERROR: Failed to extract containerd tarball" | tee -a /tmp/containerd-install.log
-        rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
-        exit 1
-    }
-    echo "Listing extracted files..." | tee -a /tmp/containerd-install.log
-    find /tmp/containerd-extract -type f >> /tmp/containerd-install.log 2>&1
-    echo "Checking for containerd binary in extracted files..." | tee -a /tmp/containerd-install.log
-    containerd_path=$(find /tmp/containerd-extract -type f -name containerd)
-    if [ -n "$containerd_path" ]; then
-        echo "Found containerd at $containerd_path" | tee -a /tmp/containerd-install.log
-        sudo mv "$containerd_path" /usr/local/bin/containerd || {
-            echo "ERROR: Failed to move containerd to /usr/local/bin/" | tee -a /tmp/containerd-install.log
-            rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
-            exit 1
-        }
-        echo "Moving other containerd binaries..." | tee -a /tmp/containerd-install.log
-        find /tmp/containerd-extract -type f -not -name containerd -exec sudo mv {} /usr/local/bin/ \; >> /tmp/containerd-install.log 2>&1 || {
-            echo "WARNING: Failed to move some containerd binaries, continuing..." | tee -a /tmp/containerd-install.log
-        }
-    else
-        echo "ERROR: containerd binary not found in tarball" | tee -a /tmp/containerd-install.log
-        rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
-        exit 1
-    fi
-    rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
-    echo "Verifying containerd binary..." | tee -a /tmp/containerd-install.log
-    [ -f /usr/local/bin/containerd ] || { echo "ERROR: containerd binary not found at /usr/local/bin/containerd" | tee -a /tmp/containerd-install.log; exit 1; }
-    sudo chmod +x /usr/local/bin/containerd
-    echo "Checking containerd permissions..." | tee -a /tmp/containerd-install.log
-    ls -l /usr/local/bin/containerd >> /tmp/containerd-install.log 2>&1
-    echo "containerd version: $(/usr/local/bin/containerd --version || echo 'version check failed')" | tee -a /tmp/containerd-install.log
-    echo "containerd dependencies: $(ldd /usr/local/bin/containerd || echo 'ldd failed')" | tee -a /tmp/containerd-install.log
-    if ! /usr/local/bin/containerd --version; then
-        echo "ERROR: containerd binary is not executable or invalid" | tee -a /tmp/containerd-install.log
-        ldd /usr/local/bin/containerd >> /tmp/containerd-install.log 2>&1 || echo "ldd failed" | tee -a /tmp/containerd-install.log
-        exit 1
-    fi
-    echo "containerd binary installed successfully" | tee -a /tmp/containerd-install.log
+    [ -f runc.amd64 ] || { echo 'ERROR: runc binary not found' >> /tmp/worker-install.log; exit 1; }
+    sudo mv runc.amd64 /usr/local/bin/runc
+    sudo chmod +x /usr/local/bin/runc
+    echo 'runc installed' >> /tmp/worker-install.log
+    /usr/local/bin/runc --version >> /tmp/worker-install.log
 
-    echo 'Installing crictl...'
+    # Install crictl
+    echo 'Installing crictl...' >> /tmp/worker-install.log
     for attempt in {1..3}; do
-        if wget -q --show-progress --https-only --timestamping \"https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz\"; then
-            echo \"crictl download successful on attempt \$attempt\"
+        echo \"Attempt \$attempt/3 to download crictl...\" >> /tmp/worker-install.log
+        if wget -q --show-progress --https-only --timestamping 'https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.28.0/crictl-v1.28.0-linux-amd64.tar.gz' 2>> /tmp/worker-install.log; then
+            echo \"crictl download successful on attempt \$attempt\" >> /tmp/worker-install.log
             break
         else
-            echo \"crictl download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            echo \"crictl download attempt \$attempt/3 failed, retrying in 5 seconds...\" >> /tmp/worker-install.log
             sleep 5
-            [ \$attempt -eq 3 ] && { echo 'ERROR: Failed to download crictl after 3 attempts'; exit 1; }
-            continue
+            [ \"\$attempt\" -eq 3 ] && { echo 'ERROR: Failed to download crictl after 3 attempts' >> /tmp/worker-install.log; exit 1; }
         fi
     done
-    [ -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz ] || { echo 'ERROR: crictl tarball not found'; exit 1; }
-    if ! file crictl-${CRICTL_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
-        echo 'ERROR: Downloaded crictl tarball is invalid'
-        exit 1
-    fi
-    sudo tar -xzf crictl-${CRICTL_VERSION}-linux-amd64.tar.gz -C /usr/local/bin/ || {
-        echo 'ERROR: Failed to extract crictl'
-        exit 1
-    }
-    rm -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
+    [ -f crictl-v1.28.0-linux-amd64.tar.gz ] || { echo 'ERROR: crictl tarball not found' >> /tmp/worker-install.log; exit 1; }
+    sudo tar -xzf crictl-v1.28.0-linux-amd64.tar.gz -C /usr/local/bin/ >> /tmp/worker-install.log 2>&1 || { echo 'ERROR: Failed to extract crictl' >> /tmp/worker-install.log; exit 1; }
+    rm -f crictl-v1.28.0-linux-amd64.tar.gz
+    echo 'crictl installed' >> /tmp/worker-install.log
+    /usr/local/bin/crictl --version >> /tmp/worker-install.log
 
-    echo 'Installing kubelet...'
+    # Install kubelet and kube-proxy
+    echo 'Installing kubelet and kube-proxy...' >> /tmp/worker-install.log
     for attempt in {1..3}; do
-        if wget -q --show-progress --https-only --timestamping \"\$selected_url\"; then
-            echo \"kubelet download successful on attempt \$attempt\"
+        echo \"Attempt \$attempt/3 to download kubelet...\" >> /tmp/worker-install.log
+        if wget -q --show-progress --https-only --timestamping 'https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kubelet' 2>> /tmp/worker-install.log; then
+            echo \"kubelet download successful on attempt \$attempt\" >> /tmp/worker-install.log
             break
         else
-            echo \"kubelet download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+            echo \"kubelet download attempt \$attempt/3 failed, retrying in 5 seconds...\" >> /tmp/worker-install.log
             sleep 5
-            [ \$attempt -eq 3 ] && { echo 'ERROR: Failed to download kubelet after 3 attempts'; exit 1; }
-            continue
+            [ \"\$attempt\" -eq 3 ] && { echo 'ERROR: Failed to download kubelet after 3 attempts' >> /tmp/worker-install.log; exit 1; }
         fi
     done
-    [ -f kubelet ] || { echo 'ERROR: kubelet file not found'; exit 1; }
-    if ! file kubelet | grep -q 'ELF 64-bit LSB executable'; then
-        echo 'ERROR: Downloaded kubelet binary is invalid'
-        rm -f kubelet
-        exit 1
-    fi
-    sudo mv kubelet /usr/local/bin/kubelet || {
-        echo 'ERROR: Failed to move kubelet to /usr/local/bin/'
-        rm -f kubelet
-        exit 1
-    }
+    [ -f kubelet ] || { echo 'ERROR: kubelet binary not found' >> /tmp/worker-install.log; exit 1; }
+    sudo mv kubelet /usr/local/bin/
     sudo chmod +x /usr/local/bin/kubelet
-    echo 'Verifying kubelet installation...'
-    if ! /usr/local/bin/kubelet --version; then
-        echo 'ERROR: kubelet binary is not executable or invalid'
-        exit 1
-    fi
+    echo 'kubelet installed' >> /tmp/worker-install.log
+    /usr/local/bin/kubelet --version >> /tmp/worker-install.log
 
-    echo 'Listing installed binaries...'
-    ls -la /opt/cni/bin
-    ls -la /usr/local/bin
-END_OF_SCRIPT
-    echo 'Checking script syntax...'
-    bash -n /tmp/worker-script.sh || { echo 'ERROR: Syntax error in worker script'; exit 1; }
-    echo 'Executing worker script...'
-    bash /tmp/worker-script.sh || { echo 'ERROR: Worker script execution failed'; exit 1; }
-" || {
-    print_error "Failed to install binaries on workers"
-    exit 1
-}
+    for attempt in {1..3}; do
+        echo \"Attempt \$attempt/3 to download kube-proxy...\" >> /tmp/worker-install.log
+        if wget -q --show-progress --https-only --timestamping 'https://dl.k8s.io/release/v1.28.0/bin/linux/amd64/kube-proxy' 2>> /tmp/worker-install.log; then
+            echo \"kube-proxy download successful on attempt \$attempt\" >> /tmp/worker-install.log
+            break
+        else
+            echo \"kube-proxy download attempt \$attempt/3 failed, retrying in 5 seconds...\" >> /tmp/worker-install.log
+            sleep 5
+            [ \"\$attempt\" -eq 3 ] && { echo 'ERROR: Failed to download kube-proxy after 3 attempts' >> /tmp/worker-install.log; exit 1; }
+        fi
+    done
+    [ -f kube-proxy ] || { echo 'ERROR: kube-proxy binary not found' >> /tmp/worker-install.log; exit 1; }
+    sudo mv kube-proxy /usr/local/bin/
+    sudo chmod +x /usr/local/bin/kube-proxy
+    echo 'kube-proxy installed' >> /tmp/worker-install.log
+    /usr/local/bin/kube-proxy --version >> /tmp/worker-install.log
 
-# Configure kubelet and kube-proxy on each worker
+    echo 'Worker dependencies installed successfully' >> /tmp/worker-install.log
+"
+run_on_nodes "worker-0 worker-1" "$run_on_workers"
+print_success "Worker dependencies installed successfully"
+
+# Step 9: Configure kubelet and kube-proxy
+print_status "Step 9: Configuring kubelet and kube-proxy..."
 while IFS= read -r line; do
     if [[ $line =~ ^worker- ]]; then
-        worker_name=$(echo $line | cut -d' ' -f1)
-        worker_host=$(echo $line | cut -d' ' -f2 | cut -d'=' -f2)
-        worker_private_ip=$(echo $line | cut -d' ' -f3 | cut -d'=' -f2)
-        pod_cidr=$(echo $line | grep -o 'pod_cidr=[^ ]*' | cut -d'=' -f2 || echo "10.200.${worker_name: -1}.0/24")
-        
-        print_status "Configuring kubelet on $worker_name ($worker_host)"
+        worker_name=$(echo "$line" | awk '{print $1}')
+        worker_host=$(echo "$line" | awk '{print $2}' | cut -d'=' -f2)
+        worker_private_ip=$(echo "$line" | awk '{print $3}' | cut -d'=' -f2)
+        pod_cidr=$(echo "$line" | grep -o 'pod_cidr=[^ ]*' | cut -d'=' -f2 || echo "10.200.${worker_name: -1}.0/24")
 
-        # Debug: Test SSH connectivity
-        ssh -F ssh_config -o ConnectTimeout=10 -o StrictHostKeyChecking=no $worker_name "echo 'SSH connection successful for $worker_name'" || {
+        print_status "Configuring $worker_name ($worker_host) with pod CIDR $pod_cidr..."
+
+        # Check SSH connectivity
+        ssh -F ssh_config -o ConnectTimeout=10 -o StrictHostKeyChecking=no $worker_name "echo 'SSH test successful for $worker_name'" || {
             print_error "Failed to SSH to $worker_name ($worker_host)"
             exit 1
         }
 
-        # Debug: List available files in certs/ and kubeconfigs/
-        echo "Available files in certs/:"
-        ls -l certs/ || echo "certs/ directory not found"
-        echo "Available files in kubeconfigs/:"
-        ls -l kubeconfigs/ || echo "kubeconfigs/ directory not found"
-
         # Check for required files
-        if [ ! -f "kubeconfigs/${worker_name}.kubeconfig" ]; then
-            echo "ERROR: Kubeconfig file for ${worker_name} not found in kubeconfigs/"
-            exit 1
-        fi
-        if [ ! -f "kubeconfigs/kube-proxy.kubeconfig" ]; then
-            echo "ERROR: kube-proxy kubeconfig file not found in kubeconfigs/"
-            exit 1
-        fi
-        if [ ! -f "certs/ca.pem" ]; then
-            echo "ERROR: ca.pem not found in certs/"
-            exit 1
-        fi
-        if [ ! -f "certs/${worker_name}.pem" ]; then
-            echo "ERROR: ${worker_name}.pem not found in certs/"
-            exit 1
-        fi
-        if [ ! -f "certs/${worker_name}-key.pem" ]; then
-            echo "ERROR: ${worker_name}-key.pem not found in certs/"
-            exit 1
-        fi
+        for file in "kubeconfigs/${worker_name}.kubeconfig" "kubeconfigs/kube-proxy.kubeconfig" "certs/ca.pem" "certs/${worker_name}.pem" "certs/${worker_name}-key.pem"; do
+            if [ ! -f "$file" ]; then
+                print_error "Required file $file not found"
+                exit 1
+            fi
+        done
 
         # Base64-encode certificates and configs
         ca_pem=$(base64 -w 0 < certs/ca.pem)
@@ -1346,54 +1173,53 @@ while IFS= read -r line; do
         worker_key_pem=$(base64 -w 0 < certs/${worker_name}-key.pem)
         kubelet_kubeconfig=$(base64 -w 0 < kubeconfigs/${worker_name}.kubeconfig)
         kube_proxy_kubeconfig=$(base64 -w 0 < kubeconfigs/kube-proxy.kubeconfig)
-        
-        ssh -F ssh_config -o ConnectTimeout=60 -o StrictHostKeyChecking=no -v $worker_name "
-            set -e
-            # Create directories
-            sudo mkdir -p /var/lib/kubelet /var/lib/kube-proxy /var/lib/kubernetes /etc/cni/net.d /etc/systemd/system /etc/containerd
 
-            # Set hostname to match inventory (fixes worker-5 issue)
-            sudo hostnamectl set-hostname $worker_name
-            echo \"127.0.0.1 localhost $worker_name\" | sudo tee /etc/hosts > /dev/null
-            echo \"$worker_private_ip $worker_name\" | sudo tee -a /etc/hosts > /dev/null
-            echo \"Set hostname to: \$(hostname)\"
+        # Configure worker
+        success=false
+        for retry in {1..3}; do
+            print_status "Attempt $retry/3 to configure $worker_name..."
+            if ssh -F ssh_config -o ConnectTimeout=60 -o StrictHostKeyChecking=no -v $worker_name "
+                set -e
+                echo 'Starting worker configuration for $worker_name at \$(date)' >> /tmp/worker-install.log
 
-            # Copy certificates and configs
-            echo '$ca_pem' | base64 -d | sudo tee /var/lib/kubernetes/ca.pem > /dev/null
-            echo '$worker_pem' | base64 -d | sudo tee /var/lib/kubelet/${worker_name}.pem > /dev/null
-            echo '$worker_key_pem' | base64 -d | sudo tee /var/lib/kubelet/${worker_name}-key.pem > /dev/null
-            echo '$kubelet_kubeconfig' | base64 -d | sudo tee /var/lib/kubelet/kubeconfig > /dev/null
-            echo '$kube_proxy_kubeconfig' | base64 -d | sudo tee /var/lib/kube-proxy/kubeconfig > /dev/null
+                # Create directories
+                sudo mkdir -p /var/lib/kubelet /var/lib/kube-proxy /var/lib/kubernetes /etc/cni/net.d /etc/systemd/system /etc/containerd
 
-            # Remove problematic sed commands that caused worker-5 mismatch
-            # (kubeconfig already uses correct system:node:$worker_name from cert generation)
+                # Set hostname
+                sudo hostnamectl set-hostname $worker_name
+                echo '127.0.0.1 localhost $worker_name' | sudo tee /etc/hosts > /dev/null
+                echo '$worker_private_ip $worker_name' | sudo tee -a /etc/hosts > /dev/null
+                echo 'Set hostname to: \$(hostname)' >> /tmp/worker-install.log
 
-            # Verify kubeconfig
-            echo 'Verifying kubeconfig...'
-            sudo grep \"user: system:node:$worker_name\" /var/lib/kubelet/kubeconfig || {
-                echo 'ERROR: kubeconfig does not contain expected node name system:node:$worker_name'
-                exit 1
-            }
+                # Copy certificates and configs
+                echo '$ca_pem' | base64 -d | sudo tee /var/lib/kubernetes/ca.pem > /dev/null
+                echo '$worker_pem' | base64 -d | sudo tee /var/lib/kubelet/${worker_name}.pem > /dev/null
+                echo '$worker_key_pem' | base64 -d | sudo tee /var/lib/kubelet/${worker_name}-key.pem > /dev/null
+                echo '$kubelet_kubeconfig' | base64 -d | sudo tee /var/lib/kubelet/kubeconfig > /dev/null
+                echo '$kube_proxy_kubeconfig' | base64 -d | sudo tee /var/lib/kube-proxy/kubeconfig > /dev/null
 
-            # Verify certificates
-            echo 'Verifying certificates in /var/lib/kubelet/ and /var/lib/kubernetes/:'
-            ls -la /var/lib/kubelet/ /var/lib/kubernetes/
-            
-            # Create containerd config with systemd cgroup driver
-            sudo tee /etc/containerd/config.toml > /dev/null <<EOF
+                # Set permissions
+                sudo chown root:root /var/lib/kubelet/* /var/lib/kube-proxy/* /var/lib/kubernetes/*
+                sudo chmod 600 /var/lib/kubelet/kubeconfig /var/lib/kubelet/${worker_name}-key.pem
+                sudo chmod 644 /var/lib/kubelet/${worker_name}.pem /var/lib/kube-proxy/kubeconfig /var/lib/kubernetes/ca.pem
+                echo 'Certificates and configs copied:' >> /tmp/worker-install.log
+                ls -l /var/lib/kubelet/ /var/lib/kube-proxy/ /var/lib/kubernetes/ >> /tmp/worker-install.log
+
+                # Create containerd config
+                sudo tee /etc/containerd/config.toml > /dev/null <<EOF
+version = 2
+[plugins.\"io.containerd.grpc.v1.cri\"]
+  sandbox_image = \"registry.k8s.io/pause:3.8\"
 [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]
+  runtime_type = \"io.containerd.runc.v2\"
   [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]
     SystemdCgroup = true
 EOF
-            echo 'Verifying containerd config...'
-            ls -l /etc/containerd/
-            sudo grep SystemdCgroup /etc/containerd/config.toml || {
-                echo 'ERROR: Failed to set SystemdCgroup in containerd config'
-                exit 1
-            }
+                echo 'Created containerd config' >> /tmp/worker-install.log
+                cat /etc/containerd/config.toml >> /tmp/worker-install.log
 
-            # Create containerd service
-            sudo tee /etc/systemd/system/containerd.service > /dev/null <<EOF
+                # Create containerd service
+                sudo tee /etc/systemd/system/containerd.service > /dev/null <<EOF
 [Unit]
 Description=containerd container runtime
 Documentation=https://containerd.io
@@ -1406,7 +1232,7 @@ Restart=always
 RestartSec=5
 Delegate=yes
 KillMode=process
-OOMScoreAdjust=-500
+OOMScoreAdjust=-999
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
@@ -1414,13 +1240,12 @@ LimitCORE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-            echo 'Verifying containerd service file...'
-            ls -l /etc/systemd/system/containerd.service
+                echo 'Created containerd service' >> /tmp/worker-install.log
 
-            # Create kubelet config with systemd cgroup driver and explicit nodeName
-            sudo tee /var/lib/kubelet/kubelet-config.yaml > /dev/null <<EOF
-kind: KubeletConfiguration
+                # Create kubelet config
+                sudo tee /var/lib/kubelet/kubelet-config.yaml > /dev/null <<EOF
 apiVersion: kubelet.config.k8s.io/v1beta1
+kind: KubeletConfiguration
 authentication:
   anonymous:
     enabled: false
@@ -1433,41 +1258,42 @@ authorization:
 clusterDomain: \"cluster.local\"
 clusterDNS:
   - \"10.32.0.10\"
-podCIDR: \"${pod_cidr}\"
+podCIDR: \"$pod_cidr\"
 resolvConf: \"/run/systemd/resolve/resolv.conf\"
 runtimeRequestTimeout: \"15m\"
 tlsCertFile: \"/var/lib/kubelet/${worker_name}.pem\"
 tlsPrivateKeyFile: \"/var/lib/kubelet/${worker_name}-key.pem\"
-cgroupDriver: systemd
-nodeName: $worker_name
+cgroupDriver: \"systemd\"
 EOF
+                echo 'Created kubelet config' >> /tmp/worker-install.log
+                cat /var/lib/kubelet/kubelet-config.yaml >> /tmp/worker-install.log
 
-            # Create kubelet service
-            sudo tee /etc/systemd/system/kubelet.service > /dev/null <<EOF
+                # Create kubelet service
+                sudo tee /etc/systemd/system/kubelet.service > /dev/null <<EOF
 [Unit]
 Description=Kubernetes Kubelet
-Documentation=https://github.com/kubernetes/kubernetes
+Documentation=https://kubernetes.io/docs/
 After=containerd.service
 Requires=containerd.service
 
 [Service]
 ExecStart=/usr/local/bin/kubelet \\
   --config=/var/lib/kubelet/kubelet-config.yaml \\
-  --container-runtime-endpoint=unix:///var/run/containerd/containerd.sock \\
+  --container-runtime-endpoint=unix:///run/containerd/containerd.sock \\
   --kubeconfig=/var/lib/kubelet/kubeconfig \\
   --register-node=true \\
-  --node-ip=${worker_private_ip} \\
+  --node-ip=$worker_private_ip \\
   --v=2
-Restart=on-failure
+Restart=always
 RestartSec=5
-TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
+                echo 'Created kubelet service' >> /tmp/worker-install.log
 
-            # Configure kube-proxy
-            sudo tee /var/lib/kube-proxy/kube-proxy-config.yaml > /dev/null <<EOF
+                # Create kube-proxy config
+                sudo tee /var/lib/kube-proxy/kube-proxy-config.yaml > /dev/null <<EOF
 kind: KubeProxyConfiguration
 apiVersion: kubeproxy.config.k8s.io/v1alpha1
 clientConnection:
@@ -1475,336 +1301,215 @@ clientConnection:
 mode: \"iptables\"
 clusterCIDR: \"10.200.0.0/16\"
 EOF
+                echo 'Created kube-proxy config' >> /tmp/worker-install.log
+                cat /var/lib/kube-proxy/kube-proxy-config.yaml >> /tmp/worker-install.log
 
-            # Create kube-proxy service
-            sudo tee /etc/systemd/system/kube-proxy.service > /dev/null <<EOF
+                # Create kube-proxy service
+                sudo tee /etc/systemd/system/kube-proxy.service > /dev/null <<EOF
 [Unit]
-Description=Kubernetes Kube Proxy
-Documentation=https://github.com/kubernetes/kubernetes
+Description=Kubernetes Kube-Proxy
+Documentation=https://kubernetes.io/docs/
 
 [Service]
 ExecStart=/usr/local/bin/kube-proxy \\
   --config=/var/lib/kube-proxy/kube-proxy-config.yaml
-Restart=on-failure
+Restart=always
 RestartSec=5
-TimeoutStartSec=0
 
 [Install]
 WantedBy=multi-user.target
 EOF
+                echo 'Created kube-proxy service' >> /tmp/worker-install.log
 
-            # Start services with error handling
-            sudo systemctl daemon-reload
-            sudo systemctl enable containerd kubelet kube-proxy
-            
-            echo 'Starting containerd...'
-            sudo systemctl start containerd
-            sleep 5
-            
-            if ! sudo systemctl is-active --quiet containerd; then
-                echo 'ERROR: containerd failed to start'
-                sudo journalctl -u containerd --lines=20 --no-pager
-                exit 1
+                # Start services
+                sudo systemctl daemon-reload
+                sudo systemctl enable containerd kubelet kube-proxy
+                echo 'Starting containerd...' >> /tmp/worker-install.log
+                sudo systemctl start containerd
+                sleep 5
+                if ! sudo systemctl is-active --quiet containerd; then
+                    echo 'ERROR: containerd failed to start' >> /tmp/worker-install.log
+                    sudo journalctl -u containerd -n 20 --no-pager >> /tmp/worker-install.log
+                    exit 1
+                fi
+                echo 'containerd started successfully' >> /tmp/worker-install.log
+
+                echo 'Starting kubelet...' >> /tmp/worker-install.log
+                sudo systemctl start kubelet
+                sleep 10
+                if ! sudo systemctl is-active --quiet kubelet; then
+                    echo 'ERROR: kubelet failed to start' >> /tmp/worker-install.log
+                    sudo journalctl -u kubelet -n 20 --no-pager >> /tmp/worker-install.log
+                    exit 1
+                fi
+                echo 'kubelet started successfully' >> /tmp/worker-install.log
+
+                echo 'Starting kube-proxy...' >> /tmp/worker-install.log
+                sudo systemctl start kube-proxy
+                sleep 5
+                if ! sudo systemctl is-active --quiet kube-proxy; then
+                    echo 'ERROR: kube-proxy failed to start' >> /tmp/worker-install.log
+                    sudo journalctl -u kube-proxy -n 20 --no-pager >> /tmp/worker-install.log
+                    exit 1
+                fi
+                echo 'kube-proxy started successfully' >> /tmp/worker-install.log
+
+                echo 'Worker configuration completed for $worker_name' >> /tmp/worker-install.log
+            "; then
+                success=true
+                print_success "Configured $worker_name successfully"
+                break
+            else
+                print_error "Failed to configure $worker_name on attempt $retry, retrying in 30 seconds..."
+                sleep 30
             fi
-            echo 'containerd started successfully'
-            
-            echo 'Starting kubelet...'
-            sudo systemctl restart kubelet
-            sleep 10
-            
-            if ! sudo systemctl is-active --quiet kubelet; then
-                echo 'ERROR: kubelet failed to start'
-                sudo journalctl -u kubelet --lines=20 --no-pager
-                exit 1
-            fi
-            echo 'kubelet started successfully'
-            
-            echo 'Starting kube-proxy...'
-            sudo systemctl start kube-proxy
-            sleep 5
-            
-            if ! sudo systemctl is-active --quiet kube-proxy; then
-                echo 'ERROR: kube-proxy failed to start'
-                sudo journalctl -u kube-proxy --lines=20 --no-pager
-                exit 1
-            fi
-            echo 'kube-proxy started successfully'
-            
-            echo 'All worker components started successfully'
-        " || {
-            print_error "Worker setup failed on $worker_name"
+        done
+        if [ "$success" = false ]; then
+            print_error "Failed to configure $worker_name after 3 attempts"
+            cat /tmp/${worker_name}-install.log
             exit 1
-        }
+        fi
     fi
-done < inventory.ini
+done < <(grep '^worker-' inventory.ini)
+print_success "Worker nodes configured successfully"
 
-# Apply RBAC for node registration
-print_status "Applying RBAC for node registration..."
-if [ ! -f "kubeconfigs/admin.kubeconfig" ]; then
-    print_error "kubeconfigs/admin.kubeconfig not found"
-    exit 1
-fi
-kubectl --kubeconfig=kubeconfigs/admin.kubeconfig apply -f - <<EOF
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: system:node
-rules:
-- apiGroups: [""]
-  resources: ["nodes"]
-  verbs: ["create", "get", "list", "watch", "update", "patch"]
-- apiGroups: [""]
-  resources: ["nodes/status"]
-  verbs: ["update", "patch"]
-- apiGroups: ["coordination.k8s.io"]
-  resources: ["leases"]
-  verbs: ["create", "get", "update"]
-- apiGroups: ["storage.k8s.io"]
-  resources: ["csinodes"]
-  verbs: ["create", "get", "update"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: system:node
-subjects:
-- kind: Group
-  name: system:nodes
-  apiGroup: rbac.authorization.k8s.io
-roleRef:
-  kind: ClusterRole
-  name: system:node
-  apiGroup: rbac.authorization.k8s.io
-EOF
+# Step 10: Configure Pod network routes
+print_status "Step 10: Configuring Pod network routes..."
+# Gather IP and subnet info
+controller_ip=$(grep '^controller-0' inventory.ini | awk '{print $3}' | cut -d'=' -f2)
+worker_0_ip=$(grep '^worker-0' inventory.ini | awk '{print $3}' | cut -d'=' -f2)
+worker_0_subnet=$(grep '^worker-0' inventory.ini | grep -o 'pod_cidr=[^ ]*' | cut -d'=' -f2 || echo "10.200.0.0/24")
+worker_1_ip=$(grep '^worker-1' inventory.ini | awk '{print $3}' | cut -d'=' -f2)
+worker_1_subnet=$(grep '^worker-1' inventory.ini | grep -o 'pod_cidr=[^ ]*' | cut -d'=' -f2 || echo "10.200.1.0/24")
 
-print_success "Worker node setup completed!"
+# Configure routes on controller-0
+print_status "Configuring routes on controller-0 ($controller_ip)..."
+run_on_nodes "controller-0" "
+    set -e
+    echo 'Configuring routes on controller-0 at \$(date)' >> /tmp/controller-install.log
+    sudo ip route add $worker_0_subnet via $worker_0_ip
+    sudo ip route add $worker_1_subnet via $worker_1_ip
+    echo 'Routes added:' >> /tmp/controller-install.log
+    ip route | grep -E '$worker_0_subnet|$worker_1_subnet' >> /tmp/controller-install.log
+"
 
-print_status "Step 9: Configuring kubectl for remote access..."
+# Configure routes on worker-0
+print_status "Configuring routes on worker-0 ($worker_0_ip)..."
+run_on_nodes "worker-0" "
+    set -e
+    echo 'Configuring routes on worker-0 at \$(date)' >> /tmp/worker-install.log
+    sudo ip route add $worker_1_subnet via $worker_1_ip
+    echo 'Routes added:' >> /tmp/worker-install.log
+    ip route | grep '$worker_1_subnet' >> /tmp/worker-install.log
+"
 
-# Create admin kubeconfig for remote access
+# Configure routes on worker-1
+print_status "Configuring routes on worker-1 ($worker_1_ip)..."
+run_on_nodes "worker-1" "
+    set -e
+    echo 'Configuring routes on worker-1 at \$(date)' >> /tmp/worker-install.log
+    sudo ip route add $worker_0_subnet via $worker_0_ip
+    echo 'Routes added:' >> /tmp/worker-install.log
+    ip route | grep '$worker_0_subnet' >> /tmp/worker-install.log
+"
+
+# Verify routes
+print_status "Verifying routes..."
+run_on_nodes "controller-0 worker-0 worker-1" "
+    echo 'Current routes on \$(hostname):' >> /tmp/\$(hostname)-install.log
+    ip route >> /tmp/\$(hostname)-install.log
+"
+print_success "Pod network routes configured successfully"
+
+# Step 11: Configure kubectl for remote access
+KUBERNETES_PUBLIC_ADDRESS=35.94.42.234
+print_status "Step 11: Configuring kubectl for remote access..."
 kubectl config set-cluster kubernetes-the-hard-way \
   --certificate-authority=certs/ca.pem \
   --embed-certs=true \
-  --server=https://${KUBERNETES_PUBLIC_ADDRESS}:6443 \
+  --server=https://$KUBERNETES_PUBLIC_ADDRESS:6443 \
   --kubeconfig=admin.kubeconfig
-
 kubectl config set-credentials admin \
   --client-certificate=certs/admin.pem \
   --client-key=certs/admin-key.pem \
   --embed-certs=true \
   --kubeconfig=admin.kubeconfig
-
 kubectl config set-context kubernetes-the-hard-way \
   --cluster=kubernetes-the-hard-way \
   --user=admin \
   --kubeconfig=admin.kubeconfig
-
 kubectl config use-context kubernetes-the-hard-way --kubeconfig=admin.kubeconfig
-
 print_success "Admin kubeconfig created: admin.kubeconfig"
 
-# Step 10: Installing Pod network - SIMPLIFIED VERSION
-print_status "Step 10: Installing Pod network..."
+# Step 12: Smoke test with busybox
+print_status "Step 12: Running DNS smoke test..."
+# Check API server connectivity
+print_status "Checking API server connectivity at $KUBERNETES_PUBLIC_ADDRESS:6443..."
+for retry in {1..3}; do
+    if nc -z -w 10 $KUBERNETES_PUBLIC_ADDRESS 6443; then
+        print_success "API server is reachable"
+        break
+    else
+        print_error "Failed to connect to API server (attempt $retry/3), retrying in 10 seconds..."
+        sleep 10
+        if [ "$retry" -eq 3 ]; then
+            print_error "Cannot reach API server at $KUBERNETES_PUBLIC_ADDRESS:6443"
+            exit 1
+        fi
+    fi
+done
 
-# Option 1: Try Flannel first (more reliable than Weave)
-print_status "Installing Flannel CNI..."
-if kubectl --kubeconfig=admin.kubeconfig apply -f https://raw.githubusercontent.com/flannel-io/flannel/master/Documentation/kube-flannel.yml; then
-    print_success "Flannel CNI installed successfully"
-    FLANNEL_INSTALLED=true
-else
-    print_error "Failed to install Flannel from internet"
-    FLANNEL_INSTALLED=false
-fi
-
-# Option 2: If Flannel fails, try local installation method
-if [ "$FLANNEL_INSTALLED" = false ]; then
-    print_status "Trying alternative CNI installation methods..."
-    
-    # Create a basic CNI configuration manually
-    run_on_workers "
-        sudo mkdir -p /etc/cni/net.d
-        sudo tee /etc/cni/net.d/10-bridge.conf > /dev/null <<EOF
-{
-    \"cniVersion\": \"0.3.1\",
-    \"name\": \"bridge\",
-    \"type\": \"bridge\",
-    \"bridge\": \"cnio0\",
-    \"isGateway\": true,
-    \"ipMasq\": true,
-    \"ipam\": {
-        \"type\": \"host-local\",
-        \"ranges\": [
-            [{\"subnet\": \"10.200.0.0/16\"}]
-        ],
-        \"routes\": [{\"dst\": \"0.0.0.0/0\"}]
-    }
-}
-EOF
-        
-        sudo tee /etc/cni/net.d/99-loopback.conf > /dev/null <<EOF
-{
-    \"cniVersion\": \"0.3.1\",
-    \"name\": \"lo\",
-    \"type\": \"loopback\"
-}
-EOF
-    "
-    
-    # Apply basic network policy
-    kubectl --kubeconfig=admin.kubeconfig apply -f - <<EOF
+# Deploy busybox pod
+cat <<EOF > busybox.yaml
 apiVersion: v1
-kind: ConfigMap
+kind: Pod
 metadata:
-  name: kube-proxy-config
-  namespace: kube-system
-data:
-  config.conf: |
-    apiVersion: kubeproxy.config.k8s.io/v1alpha1
-    kind: KubeProxyConfiguration
-    clusterCIDR: "10.200.0.0/16"
-    mode: "iptables"
-EOF
-    
-    print_status "Basic CNI configuration applied"
-fi
-
-# Wait for a moment to let things settle
-sleep 30
-
-# Try to install CoreDNS if not already present
-print_status "Ensuring CoreDNS is installed..."
-if ! kubectl --kubeconfig=admin.kubeconfig get deployment coredns -n kube-system >/dev/null 2>&1; then
-    kubectl --kubeconfig=admin.kubeconfig apply -f - <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: coredns
-  namespace: kube-system
-  labels:
-    k8s-app: kube-dns
+  name: busybox
+  namespace: default
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      k8s-app: kube-dns
-  template:
-    metadata:
-      labels:
-        k8s-app: kube-dns
-    spec:
-      containers:
-      - name: coredns
-        image: coredns/coredns:1.8.4
-        imagePullPolicy: IfNotPresent
-        resources:
-          limits:
-            memory: 170Mi
-          requests:
-            cpu: 100m
-            memory: 70Mi
-        args: [ "-conf", "/etc/coredns/Corefile" ]
-        volumeMounts:
-        - name: config-volume
-          mountPath: /etc/coredns
-          readOnly: true
-        ports:
-        - containerPort: 53
-          name: dns
-          protocol: UDP
-        - containerPort: 53
-          name: dns-tcp
-          protocol: TCP
-        - containerPort: 9153
-          name: metrics
-          protocol: TCP
-      dnsPolicy: Default
-      volumes:
-      - name: config-volume
-        configMap:
-          name: coredns
-          items:
-          - key: Corefile
-            path: Corefile
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: coredns
-  namespace: kube-system
-data:
-  Corefile: |
-    .:53 {
-        errors
-        health {
-           lameduck 5s
-        }
-        ready
-        kubernetes cluster.local in-addr.arpa ip6.arpa {
-           pods insecure
-           fallthrough in-addr.arpa ip6.arpa
-           ttl 30
-        }
-        prometheus :9153
-        forward . 8.8.8.8
-        cache 30
-        loop
-        reload
-        loadbalance
-    }
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: kube-dns
-  namespace: kube-system
-  labels:
-    k8s-app: kube-dns
-spec:
-  selector:
-    k8s-app: kube-dns
-  clusterIP: 10.32.0.10
-  ports:
-  - name: dns
-    port: 53
-    protocol: UDP
-  - name: dns-tcp
-    port: 53
-    protocol: TCP
-  - name: metrics
-    port: 9153
-    protocol: TCP
+  containers:
+  - name: busybox
+    image: busybox:1.28
+    command:
+      - sleep
+      - "3600"
+    imagePullPolicy: IfNotPresent
+  restartPolicy: Always
 EOF
-    print_success "CoreDNS installed"
-else
-    print_success "CoreDNS already present"
+
+kubectl --kubeconfig=admin.kubeconfig apply -f busybox.yaml || {
+    print_error "Failed to apply busybox manifest"
+    exit 1
+}
+rm -f busybox.yaml
+
+# Wait for busybox pod to be running
+print_status "Waiting for busybox pod to be ready..."
+for i in {1..30}; do
+    busybox_ready=$(kubectl --kubeconfig=admin.kubeconfig get pod busybox -o jsonpath='{..status.phase}' | grep Running | wc -l)
+    if [ "$busybox_ready" -eq 1 ]; then
+        print_success "Busybox pod is ready"
+        break
+    fi
+    sleep 10
+done
+if [ "$busybox_ready" -ne 1 ]; then
+    print_error "Busybox pod failed to become ready"
+    kubectl --kubeconfig=admin.kubeconfig describe pod busybox
+    exit 1
 fi
 
-print_success "Pod network setup completed!"
-
-# Additional setup to help nodes join
-print_status "Configuring additional networking for node registration..."
-
-# Ensure proper routing on workers
-run_on_workers "
-    # Add route for service subnet
-    sudo ip route add 10.32.0.0/24 via \$(ip route | grep default | awk '{print \$3}') || true
-    
-    # Enable IP forwarding
-    echo 'net.ipv4.ip_forward=1' | sudo tee -a /etc/sysctl.conf
-    sudo sysctl -p
-    
-    # Restart kubelet to pick up any changes
-    sudo systemctl restart kubelet
-    
-    echo 'Worker networking configuration updated'
-" || {
-    print_error "Some worker networking configuration failed, but continuing..."
+# Run DNS test
+print_status "Running DNS test in busybox pod..."
+kubectl --kubeconfig=admin.kubeconfig exec busybox -- nslookup kubernetes || {
+    print_error "DNS test failed"
+    kubectl --kubeconfig=admin.kubeconfig logs busybox
+    exit 1
 }
+print_success "DNS smoke test passed"
 
-print_success "Pod network installation completed!"
-
-# Final verification
-print_status "Final verification..."
+# Step 13: Final verification
+print_status "Step 13: Final verification..."
 print_status "Getting cluster nodes..."
 kubectl --kubeconfig=admin.kubeconfig get nodes -o wide
 print_status "Getting cluster pods..."
@@ -1815,23 +1520,24 @@ kubectl --kubeconfig=admin.kubeconfig get componentstatuses
 print_success "Kubernetes The Hard Way setup completed successfully!"
 print_success "Use 'kubectl --kubeconfig=admin.kubeconfig' to interact with your cluster"
 print_success "Or copy admin.kubeconfig to ~/.kube/config to use kubectl normally"
-echo
-echo "=============================================="
-echo "  Kubernetes The Hard Way Setup Complete!"
-echo "=============================================="
-echo "Cluster endpoint: https://${KUBERNETES_PUBLIC_ADDRESS}:6443"
-echo "Admin kubeconfig: admin.kubeconfig"
-echo "SSH config: ssh_config"
-echo "Private key: k8s-key.pem"
-echo
-echo "Quick test commands:"
-echo "  kubectl --kubeconfig=admin.kubeconfig get nodes"
-echo "  kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces"
-echo "  kubectl --kubeconfig=admin.kubeconfig cluster-info"
-echo
-echo "To use kubectl without --kubeconfig flag:"
-echo "  export KUBECONFIG=$PWD/admin.kubeconfig"
-echo "  # OR"
-echo "  cp admin.kubeconfig ~/.kube/config"
-echo "=============================================="
-echo -e "${NC}"
+
+cat <<EOF
+==============================================
+  Kubernetes The Hard Way Setup Complete!
+==============================================
+Cluster endpoint: https://$KUBERNETES_PUBLIC_ADDRESS:6443
+Admin kubeconfig: admin.kubeconfig
+SSH config: ssh_config
+Private key: k8s-key.pem
+
+Quick test commands:
+  kubectl --kubeconfig=admin.kubeconfig get nodes
+  kubectl --kubeconfig=admin.kubeconfig get pods --all-namespaces
+  kubectl --kubeconfig=admin.kubeconfig cluster-info
+
+To use kubectl without --kubeconfig flag:
+  export KUBECONFIG=$(pwd)/admin.kubeconfig
+  # OR
+  cp admin.kubeconfig ~/.kube/config
+==============================================
+EOF
