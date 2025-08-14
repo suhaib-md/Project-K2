@@ -184,7 +184,7 @@ echo "  Kubernetes The Hard Way Deployment Complete!"
 echo "=============================================="
 echo -e "${NC}"
 
-echo "Load Balancer DNS: $(terraform output -raw load_balancer_dns)"
+echo "Kubernetes API Endpoint: $(terraform output -raw kubernetes_api_endpoint)"
 echo "Admin Kubeconfig: admin.kubeconfig"
 echo "SSH Config: ssh_config"
 echo "Private Key: k8s-key.pem"

@@ -17,6 +17,7 @@ CNI_VERSION=v1.1.0
 CONTAINERD_VERSION=1.7.3
 CRICTL_VERSION=v1.28.0
 KUBELET_VERSION=v1.28.3
+RUNC_VERSION="v1.1.12"
 
 KUBERNETES_PUBLIC_ADDRESS="${LB_DNS}"
 
@@ -1011,6 +1012,10 @@ print_status "Step 8: Setting up worker nodes..."
 # Install binaries on workers
 run_on_workers "
     set -e
+    # Debug: Dump script to file for syntax checking
+    echo 'Dumping script to /tmp/worker-script.sh for debugging...'
+    cat > /tmp/worker-script.sh <<'END_OF_SCRIPT'
+    set -e
     echo 'Checking system resources...'
     df -h /
     lsblk
@@ -1033,12 +1038,12 @@ run_on_workers "
     }
 
     echo 'Checking network connectivity to dl.k8s.io...'
-    primary_url=\"https://dl.k8s.io/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet\"
-    fallback_url=\"https://storage.googleapis.com/kubernetes-release/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet\"
+    primary_url='https://dl.k8s.io/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet'
+    fallback_url='https://storage.googleapis.com/kubernetes-release/release/${KUBELET_VERSION}/bin/linux/amd64/kubelet'
     selected_url=\"\$primary_url\"
     for attempt in {1..5}; do
         echo \"Attempt \$attempt/5 to reach \$selected_url...\"
-        http_status=\$(curl -s -L -w \"%{http_code}\" \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt -o /dev/null)
+        http_status=\$(curl -s -L -w '%{http_code}' \"\$selected_url\" --connect-timeout 10 --cacert /etc/ssl/certs/ca-certificates.crt -o /dev/null)
         if [ \"\$http_status\" -eq 200 ]; then
             echo \"Successfully reached \$selected_url (HTTP \$http_status)\"
             break
@@ -1048,7 +1053,7 @@ run_on_workers "
             echo 'Checking DNS resolution...'
             nslookup dl.k8s.io || echo 'DNS resolution failed'
             if [ \$attempt -eq 3 ] && [ \"\$selected_url\" = \"\$primary_url\" ]; then
-                echo 'Switching to fallback URL: \$fallback_url'
+                echo \"Switching to fallback URL: \$fallback_url\"
                 selected_url=\"\$fallback_url\"
             fi
             if [ \$attempt -eq 5 ]; then
@@ -1065,25 +1070,20 @@ run_on_workers "
         echo 'ERROR: Failed to install packages'
         exit 1
     }
-    
+
     echo 'Installing CNI plugins...'
     for attempt in {1..3}; do
-        wget -q --show-progress --https-only --timestamping \
-            \"https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz\" || {
+        if wget -q --show-progress --https-only --timestamping \"https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-amd64-${CNI_VERSION}.tgz\"; then
+            echo \"CNI plugins download successful on attempt \$attempt\"
+            break
+        else
             echo \"CNI download attempt \$attempt/3 failed, retrying in 5 seconds...\"
             sleep 5
-            if [ \$attempt -eq 3 ]; then
-                echo 'ERROR: Failed to download CNI plugins after 3 attempts'
-                exit 1
-            fi
+            [ \$attempt -eq 3 ] && { echo 'ERROR: Failed to download CNI plugins after 3 attempts'; exit 1; }
             continue
-        }
-        if [ ! -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz ]; then
-            echo 'ERROR: CNI tarball not found after download attempt \$attempt'
-            exit 1
         fi
-        break
     done
+    [ -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz ] || { echo 'ERROR: CNI tarball not found'; exit 1; }
     if ! file cni-plugins-linux-amd64-${CNI_VERSION}.tgz | grep -q 'gzip compressed data'; then
         echo 'ERROR: Downloaded CNI tarball is invalid'
         exit 1
@@ -1094,53 +1094,155 @@ run_on_workers "
         exit 1
     }
     rm -f cni-plugins-linux-amd64-${CNI_VERSION}.tgz
-    
-    echo 'Installing containerd...'
-    for attempt in {1..3}; do
-        wget -q --show-progress --https-only --timestamping \
-            \"https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz\" || {
-            echo \"Containerd download attempt \$attempt/3 failed, retrying in 5 seconds...\"
+
+    echo 'Installing runc...'
+    for attempt in {1..5}; do
+        echo "Attempt $attempt/5 to download runc..."
+        primary_url='https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.amd64'
+        checksum_url='https://github.com/opencontainers/runc/releases/download/${RUNC_VERSION}/runc.sha256sum'
+        
+        if wget -q --show-progress --https-only --timestamping "$primary_url" -O runc.amd64; then
+            echo "runc download successful on attempt $attempt"
+        else
+            echo "runc download attempt $attempt/5 failed, retrying in 5 seconds..."
+            wget -v -O /dev/null "$primary_url" 2>&1 | grep -E 'ERROR|failed' || true
             sleep 5
-            if [ \$attempt -eq 3 ]; then
-                echo 'ERROR: Failed to download containerd after 3 attempts'
-                exit 1
-            fi
+            [ "$attempt" -eq 5 ] && { echo "ERROR: Failed to download runc after 5 attempts"; exit 1; }
             continue
-        }
-        if [ ! -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz ]; then
-            echo 'ERROR: Containerd tarball not found after download attempt \$attempt'
-            exit 1
         fi
-        break
+        
+        [ -f runc.amd64 ] || { echo "ERROR: runc binary not found after download attempt $attempt"; exit 1; }
+        
+        echo 'Downloading runc checksum...'
+        if wget -q --https-only --timestamping "$checksum_url" -O runc.sha256sum; then
+            echo 'Verifying runc checksum...'
+            if grep runc.amd64 runc.sha256sum | sha256sum -c; then
+                echo 'runc checksum verified'
+                rm -f runc.sha256sum
+            else
+                echo 'ERROR: runc checksum verification failed'
+                rm -f runc.amd64 runc.sha256sum
+                [ "$attempt" -eq 5 ] && { echo "ERROR: Checksum verification failed after 5 attempts"; exit 1; }
+                continue
+            fi
+        else
+            echo "WARNING: Failed to download checksum, skipping for attempt $attempt"
+        fi
+        
+        echo 'Verifying runc binary format...'
+        chmod +x runc.amd64 || { echo "ERROR: Failed to set execute permissions on runc.amd64"; exit 1; }
+        echo "File type: $(file runc.amd64)"
+        echo "Library dependencies: $(ldd runc.amd64 2>&1 || echo 'ldd failed')"
+        if file runc.amd64 | grep -q 'ELF 64-bit LSB \(executable\|shared object\)'; then
+            echo 'runc binary is valid ELF 64-bit executable or shared object'
+            if ./runc.amd64 --version 2>/dev/null | grep -q 'runc version'; then
+                echo 'runc binary is executable'
+                break
+            else
+                echo 'ERROR: runc binary is not executable'
+                ldd runc.amd64 || echo 'ldd failed'
+                rm -f runc.amd64
+                [ "$attempt" -eq 5 ] && { echo "ERROR: runc binary validation failed after 5 attempts"; exit 1; }
+                continue
+            fi
+        else
+            echo 'ERROR: Downloaded runc binary is invalid'
+            file runc.amd64 || echo 'file command failed'
+            rm -f runc.amd64
+            [ "$attempt" -eq 5 ] && { echo "ERROR: runc binary validation failed after 5 attempts"; exit 1; }
+            continue
+        fi
     done
-    if ! file containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
-        echo 'ERROR: Downloaded containerd tarball is invalid'
+    
+    sudo install -m 0755 runc.amd64 /usr/local/bin/runc || { echo 'ERROR: Failed to install runc to /usr/local/bin/'; rm -f runc.amd64; exit 1; }
+    rm -f runc.amd64
+    echo 'Verifying runc installation...'
+    if ! /usr/local/bin/runc --version; then
+        echo 'ERROR: runc binary is not executable or invalid'
+        ldd /usr/local/bin/runc || echo 'ldd failed'
         exit 1
     fi
-    sudo tar -xzf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz -C /usr/local || {
-        echo 'ERROR: Failed to extract containerd'
+    echo 'runc installed successfully'
+
+    echo 'Installing containerd...' | tee -a /tmp/containerd-install.log
+    for attempt in {1..3}; do
+        echo "Attempt $attempt/3 to download containerd..." | tee -a /tmp/containerd-install.log
+        if wget -q --show-progress --https-only --timestamping "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" 2>> /tmp/containerd-install.log; then
+            echo "containerd download successful on attempt $attempt" | tee -a /tmp/containerd-install.log
+            break
+        else
+            echo "containerd download attempt $attempt/3 failed, retrying in 5 seconds..." | tee -a /tmp/containerd-install.log
+            wget -v -O /dev/null "https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz" 2>> /tmp/containerd-install.log || true
+            sleep 5
+            [ "$attempt" -eq 3 ] && { echo "ERROR: Failed to download containerd after 3 attempts" | tee -a /tmp/containerd-install.log; exit 1; }
+            continue
+        fi
+    done
+    [ -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz ] || { echo "ERROR: containerd tarball not found" | tee -a /tmp/containerd-install.log; exit 1; }
+    echo "Verifying containerd tarball..." | tee -a /tmp/containerd-install.log
+    if ! file containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
+        echo "ERROR: Downloaded containerd tarball is invalid" | tee -a /tmp/containerd-install.log
+        rm -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
+        exit 1
+    fi
+    echo "Inspecting containerd tarball contents..." | tee -a /tmp/containerd-install.log
+    tar -tzf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz >> /tmp/containerd-install.log 2>&1 || { echo "ERROR: Failed to inspect containerd tarball" | tee -a /tmp/containerd-install.log; exit 1; }
+    echo "Extracting containerd tarball..." | tee -a /tmp/containerd-install.log
+    sudo mkdir -p /usr/local/bin
+    mkdir -p /tmp/containerd-extract
+    sudo tar -xzf containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz -C /tmp/containerd-extract >> /tmp/containerd-install.log 2>&1 || {
+        echo "ERROR: Failed to extract containerd tarball" | tee -a /tmp/containerd-install.log
+        rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
         exit 1
     }
-    rm -f containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
-    
+    echo "Listing extracted files..." | tee -a /tmp/containerd-install.log
+    find /tmp/containerd-extract -type f >> /tmp/containerd-install.log 2>&1
+    echo "Checking for containerd binary in extracted files..." | tee -a /tmp/containerd-install.log
+    containerd_path=$(find /tmp/containerd-extract -type f -name containerd)
+    if [ -n "$containerd_path" ]; then
+        echo "Found containerd at $containerd_path" | tee -a /tmp/containerd-install.log
+        sudo mv "$containerd_path" /usr/local/bin/containerd || {
+            echo "ERROR: Failed to move containerd to /usr/local/bin/" | tee -a /tmp/containerd-install.log
+            rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
+            exit 1
+        }
+        echo "Moving other containerd binaries..." | tee -a /tmp/containerd-install.log
+        find /tmp/containerd-extract -type f -not -name containerd -exec sudo mv {} /usr/local/bin/ \; >> /tmp/containerd-install.log 2>&1 || {
+            echo "WARNING: Failed to move some containerd binaries, continuing..." | tee -a /tmp/containerd-install.log
+        }
+    else
+        echo "ERROR: containerd binary not found in tarball" | tee -a /tmp/containerd-install.log
+        rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
+        exit 1
+    fi
+    rm -rf /tmp/containerd-extract containerd-${CONTAINERD_VERSION}-linux-amd64.tar.gz
+    echo "Verifying containerd binary..." | tee -a /tmp/containerd-install.log
+    [ -f /usr/local/bin/containerd ] || { echo "ERROR: containerd binary not found at /usr/local/bin/containerd" | tee -a /tmp/containerd-install.log; exit 1; }
+    sudo chmod +x /usr/local/bin/containerd
+    echo "Checking containerd permissions..." | tee -a /tmp/containerd-install.log
+    ls -l /usr/local/bin/containerd >> /tmp/containerd-install.log 2>&1
+    echo "containerd version: $(/usr/local/bin/containerd --version || echo 'version check failed')" | tee -a /tmp/containerd-install.log
+    echo "containerd dependencies: $(ldd /usr/local/bin/containerd || echo 'ldd failed')" | tee -a /tmp/containerd-install.log
+    if ! /usr/local/bin/containerd --version; then
+        echo "ERROR: containerd binary is not executable or invalid" | tee -a /tmp/containerd-install.log
+        ldd /usr/local/bin/containerd >> /tmp/containerd-install.log 2>&1 || echo "ldd failed" | tee -a /tmp/containerd-install.log
+        exit 1
+    fi
+    echo "containerd binary installed successfully" | tee -a /tmp/containerd-install.log
+
     echo 'Installing crictl...'
     for attempt in {1..3}; do
-        wget -q --show-progress --https-only --timestamping \
-            \"https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz\" || {
+        if wget -q --show-progress --https-only --timestamping \"https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz\"; then
+            echo \"crictl download successful on attempt \$attempt\"
+            break
+        else
             echo \"crictl download attempt \$attempt/3 failed, retrying in 5 seconds...\"
             sleep 5
-            if [ \$attempt -eq 3 ]; then
-                echo 'ERROR: Failed to download crictl after 3 attempts'
-                exit 1
-            fi
+            [ \$attempt -eq 3 ] && { echo 'ERROR: Failed to download crictl after 3 attempts'; exit 1; }
             continue
-        }
-        if [ ! -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz ]; then
-            echo 'ERROR: crictl tarball not found after download attempt \$attempt'
-            exit 1
         fi
-        break
     done
+    [ -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz ] || { echo 'ERROR: crictl tarball not found'; exit 1; }
     if ! file crictl-${CRICTL_VERSION}-linux-amd64.tar.gz | grep -q 'gzip compressed data'; then
         echo 'ERROR: Downloaded crictl tarball is invalid'
         exit 1
@@ -1150,25 +1252,20 @@ run_on_workers "
         exit 1
     }
     rm -f crictl-${CRICTL_VERSION}-linux-amd64.tar.gz
-    
+
     echo 'Installing kubelet...'
     for attempt in {1..3}; do
-        wget -q --show-progress --https-only --timestamping \
-            \"\$selected_url\" || {
+        if wget -q --show-progress --https-only --timestamping \"\$selected_url\"; then
+            echo \"kubelet download successful on attempt \$attempt\"
+            break
+        else
             echo \"kubelet download attempt \$attempt/3 failed, retrying in 5 seconds...\"
             sleep 5
-            if [ \$attempt -eq 3 ]; then
-                echo 'ERROR: Failed to download kubelet after 3 attempts'
-                exit 1
-            fi
+            [ \$attempt -eq 3 ] && { echo 'ERROR: Failed to download kubelet after 3 attempts'; exit 1; }
             continue
-        }
-        if [ ! -f kubelet ]; then
-            echo 'ERROR: kubelet file not found after download attempt \$attempt'
-            exit 1
         fi
-        break
     done
+    [ -f kubelet ] || { echo 'ERROR: kubelet file not found'; exit 1; }
     if ! file kubelet | grep -q 'ELF 64-bit LSB executable'; then
         echo 'ERROR: Downloaded kubelet binary is invalid'
         rm -f kubelet
@@ -1185,10 +1282,15 @@ run_on_workers "
         echo 'ERROR: kubelet binary is not executable or invalid'
         exit 1
     fi
-    
+
     echo 'Listing installed binaries...'
     ls -la /opt/cni/bin
     ls -la /usr/local/bin
+END_OF_SCRIPT
+    echo 'Checking script syntax...'
+    bash -n /tmp/worker-script.sh || { echo 'ERROR: Syntax error in worker script'; exit 1; }
+    echo 'Executing worker script...'
+    bash /tmp/worker-script.sh || { echo 'ERROR: Worker script execution failed'; exit 1; }
 " || {
     print_error "Failed to install binaries on workers"
     exit 1
@@ -1250,9 +1352,11 @@ while IFS= read -r line; do
             # Create directories
             sudo mkdir -p /var/lib/kubelet /var/lib/kube-proxy /var/lib/kubernetes /etc/cni/net.d /etc/systemd/system /etc/containerd
 
-            # Get actual node name from hostname
-            node_name=\$(hostname)
-            echo \"Detected node name: \$node_name\"
+            # Set hostname to match inventory (fixes worker-5 issue)
+            sudo hostnamectl set-hostname $worker_name
+            echo \"127.0.0.1 localhost $worker_name\" | sudo tee /etc/hosts > /dev/null
+            echo \"$worker_private_ip $worker_name\" | sudo tee -a /etc/hosts > /dev/null
+            echo \"Set hostname to: \$(hostname)\"
 
             # Copy certificates and configs
             echo '$ca_pem' | base64 -d | sudo tee /var/lib/kubernetes/ca.pem > /dev/null
@@ -1261,14 +1365,13 @@ while IFS= read -r line; do
             echo '$kubelet_kubeconfig' | base64 -d | sudo tee /var/lib/kubelet/kubeconfig > /dev/null
             echo '$kube_proxy_kubeconfig' | base64 -d | sudo tee /var/lib/kube-proxy/kubeconfig > /dev/null
 
-            # Fix kubeconfig node name to match actual hostname
-            sudo sed -i \"s/system:node:${worker_name}/system:node:\$node_name/g\" /var/lib/kubelet/kubeconfig
-            sudo sed -i \"s/system:node:worker-0/system:node:\$node_name/g\" /var/lib/kubelet/kubeconfig
+            # Remove problematic sed commands that caused worker-5 mismatch
+            # (kubeconfig already uses correct system:node:$worker_name from cert generation)
 
             # Verify kubeconfig
             echo 'Verifying kubeconfig...'
-            sudo grep \"user: system:node:\$node_name\" /var/lib/kubelet/kubeconfig || {
-                echo 'ERROR: Failed to update kubeconfig node name'
+            sudo grep \"user: system:node:$worker_name\" /var/lib/kubelet/kubeconfig || {
+                echo 'ERROR: kubeconfig does not contain expected node name system:node:$worker_name'
                 exit 1
             }
 
@@ -1276,7 +1379,7 @@ while IFS= read -r line; do
             echo 'Verifying certificates in /var/lib/kubelet/ and /var/lib/kubernetes/:'
             ls -la /var/lib/kubelet/ /var/lib/kubernetes/
             
-            # Create containerd config
+            # Create containerd config with systemd cgroup driver
             sudo tee /etc/containerd/config.toml > /dev/null <<EOF
 [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc]
   [plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.runc.options]
@@ -1284,6 +1387,10 @@ while IFS= read -r line; do
 EOF
             echo 'Verifying containerd config...'
             ls -l /etc/containerd/
+            sudo grep SystemdCgroup /etc/containerd/config.toml || {
+                echo 'ERROR: Failed to set SystemdCgroup in containerd config'
+                exit 1
+            }
 
             # Create containerd service
             sudo tee /etc/systemd/system/containerd.service > /dev/null <<EOF
@@ -1310,7 +1417,7 @@ EOF
             echo 'Verifying containerd service file...'
             ls -l /etc/systemd/system/containerd.service
 
-            # Create kubelet config
+            # Create kubelet config with systemd cgroup driver and explicit nodeName
             sudo tee /var/lib/kubelet/kubelet-config.yaml > /dev/null <<EOF
 kind: KubeletConfiguration
 apiVersion: kubelet.config.k8s.io/v1beta1
@@ -1331,7 +1438,8 @@ resolvConf: \"/run/systemd/resolve/resolv.conf\"
 runtimeRequestTimeout: \"15m\"
 tlsCertFile: \"/var/lib/kubelet/${worker_name}.pem\"
 tlsPrivateKeyFile: \"/var/lib/kubelet/${worker_name}-key.pem\"
-cgroupDriver: \"systemd\"
+cgroupDriver: systemd
+nodeName: $worker_name
 EOF
 
             # Create kubelet service
@@ -1448,6 +1556,12 @@ rules:
 - apiGroups: [""]
   resources: ["nodes/status"]
   verbs: ["update", "patch"]
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["create", "get", "update"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["csinodes"]
+  verbs: ["create", "get", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
